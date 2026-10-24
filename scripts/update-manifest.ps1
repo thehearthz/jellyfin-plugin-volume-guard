@@ -1,5 +1,5 @@
 param(
-    [string]$Version = '0.3.0.0',
+    [string]$Version = '0.3.1.0',
     [string]$Repository = 'thehearthz/jellyfin-plugin-volume-guard'
 )
 $ErrorActionPreference = 'Stop'
@@ -14,12 +14,12 @@ $entry = [ordered]@{
     guid = 'c49aef32-6c2e-462c-a5ee-40e18c8d28af'
     name = 'Volume Guard'
     overview = 'Server leveling, dialogue boost, measured loudness and night profiles'
-    description = 'Experimental audio processing for Jellyfin 12.2 and standard Moonfin. Includes leveling, peak limiting, dialogue emphasis, per-device modes, cached local-library loudness analysis and administrator playback status. Optional active switching requests a brief playback reconnect; Live TV returns to the live edge. No companion app required. Enable server processing in plugin settings. Physical client and Live TV validation remains necessary.'
+    description = 'Experimental audio processing for Jellyfin 12.2 and standard Moonfin. Includes leveling, peak limiting, dialogue emphasis, per-device modes, cached local-library loudness analysis and administrator playback status. Optional Plugin Pages 3 integration adds Volume Guard to Jellyfin web navigation. Active switching requests a brief reconnect; Live TV returns to the live edge. No companion app required. Physical client and Live TV validation remains necessary.'
     owner = $Repository.Split('/')[0]
     category = 'General'
     versions = @([ordered]@{
         version = $Version
-        changelog = 'Adds dialogue emphasis, whole-track local movie/episode loudness analysis with persistent cache, per-device mode/boost overrides, confirmed encoder status, and opt-in switching during playback via a brief reconnect. Movies resume at the reported position; Live TV returns to the live edge. Run Volume Guard loudness analysis in Scheduled Tasks after enabling analysis. New features default off/inherit. Automated checks pass; actual Chromecast/server/Live TV playback remains unverified.'
+        changelog = 'Adds optional Plugin Pages 3 registration for the Volume Guard controls/status page in Jellyfin web navigation. Reuses the existing settings component with fragment initialization and authenticated APIs; configuration and status remain administrator-only. The normal dashboard page works without Plugin Pages. Requires compatible Plugin Pages and File Transformation installations for the sidebar entry. Audio features remain unchanged. Actual full-server/client validation remains necessary.'
         targetAbi = '12.2.0.0'
         sourceUrl = "https://github.com/$Repository/releases/download/v$Version/volume-guard-server-$Version.zip"
         checksum = (Get-FileHash -LiteralPath $archive -Algorithm MD5).Hash.ToLowerInvariant()

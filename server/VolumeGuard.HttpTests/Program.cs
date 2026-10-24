@@ -61,6 +61,16 @@ Check((await Request(HttpMethod.Get, "/VolumeGuard/configuration")).StatusCode =
 Check((await Request(HttpMethod.Post, "/VolumeGuard/configuration", body: new Configuration())).StatusCode == HttpStatusCode.Unauthorized, "Anonymous write denied");
 Check((await Request(HttpMethod.Get, "/VolumeGuard/configuration", "User")).StatusCode == HttpStatusCode.Forbidden, "Non-admin read denied");
 Check((await Request(HttpMethod.Post, "/VolumeGuard/configuration", "User", new Configuration())).StatusCode == HttpStatusCode.Forbidden, "Non-admin write denied");
+Check((await Request(HttpMethod.Get, "/VolumeGuard/page")).StatusCode == HttpStatusCode.Unauthorized, "Plugin Pages shell requires authentication");
+var pluginPage = await Request(HttpMethod.Get, "/VolumeGuard/page", "User");
+Check(pluginPage.StatusCode == HttpStatusCode.OK, "Authenticated Plugin Pages shell is available");
+Check(pluginPage.Content.Headers.ContentType?.MediaType == "text/html", "Plugin Pages shell is HTML");
+Check(pluginPage.Headers.CacheControl?.NoStore == true, "Plugin Pages shell is not cached across sessions");
+var fragment = await pluginPage.Content.ReadAsStringAsync();
+Check(fragment.Contains("data-vg-plugin-pages=\"true\"", StringComparison.Ordinal), "Plugin Pages shell marks immediate initialization");
+Check(!fragment.Contains("<html", StringComparison.OrdinalIgnoreCase) && !fragment.Contains("<body", StringComparison.OrdinalIgnoreCase), "Plugin Pages shell excludes document wrapper");
+Check(!fragment.Contains("data-role=\"page\"", StringComparison.Ordinal) && !fragment.Contains("pluginConfigurationPage", StringComparison.Ordinal), "Plugin Pages shell does not nest Jellyfin router pages");
+Check(fragment.Contains("vg-dialogue", StringComparison.Ordinal) && fragment.Contains("vg-devices", StringComparison.Ordinal), "Plugin Pages shell uses complete settings component");
 var policyResponse = await Request(HttpMethod.Get, "/VolumeGuard/policy?userId=someone-else", "User");
 Check(policyResponse.StatusCode == HttpStatusCode.OK, "Authenticated policy works without userId claim");
 using var policyJson = JsonDocument.Parse(await policyResponse.Content.ReadAsStringAsync());

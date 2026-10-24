@@ -51,6 +51,7 @@ public sealed class VolumeGuardStatusController(IServiceProvider services) : Con
         return Ok(new
         {
             serverTimeUtc = now, devices,
+            pluginPages = new { registered = PluginPagesIntegration.IsRegistered, status = PluginPagesIntegration.Status },
             analysis = new
             {
                 enabled = configuration.LoudnessAnalysisEnabled, cachedTracks = analysis?.CachedTracks ?? 0,

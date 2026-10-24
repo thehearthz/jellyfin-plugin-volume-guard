@@ -1,4 +1,4 @@
-# Volume Guard — experimental server plugin 0.3
+# Volume Guard — experimental server plugin 0.3.1
 
 Audio leveling, peak limiting and scheduled night listening for **Jellyfin Server 12.2**, designed to work with **standard Moonfin 2.6.0 on Chromecast with Google TV**. Version 0.3 processes audio on the server. No companion app is required.
 
@@ -12,15 +12,22 @@ The plugin builds against Jellyfin's real 12.2 packages and has automated negoti
    https://raw.githubusercontent.com/thehearthz/jellyfin-plugin-volume-guard/main/manifest.json
    ```
 
-2. Open **Dashboard → Plugins → Catalog**, install **Volume Guard 0.3.0.0**, and restart Jellyfin. Existing users should update the plugin and restart.
+2. Open **Dashboard → Plugins → Catalog**, install **Volume Guard 0.3.1.0**, and restart Jellyfin. Existing users should update the plugin and restart.
 3. As an administrator, open **Dashboard → Plugins → Volume Guard**. Turn on both **Enable Volume Guard** and **Process audio on the Jellyfin server**. Server processing starts disabled, so installation alone does not alter playback.
 4. Choose **Balanced**, **Night**, or **Auto**. For Auto, set your time zone and night hours. The initial time zone is **UTC**; use **America/New_York** if appropriate.
 5. Save, then start new playback in your existing Moonfin app. The Jellyfin user must have permission to transcode audio. For changes during playback, enable the optional automatic switching setting, or stop and start a new playback session.
 
 To turn processing off before a movie or show, use the master switch or select **Off** in the plugin settings, save, then begin playback. These controls apply globally to users of this server. A Jellyfin plugin cannot add a button to stock Moonfin's player or show/movie preview screen; those controls would require a Moonfin app change.
 
-Manual installation: stop Jellyfin, extract the [server ZIP](https://github.com/thehearthz/jellyfin-plugin-volume-guard/releases/download/v0.3.0.0/volume-guard-server-0.3.0.0.zip) into a `Volume Guard` folder in your server's configured plugins directory, and restart. [Releases and checksums](https://github.com/thehearthz/jellyfin-plugin-volume-guard/releases).
+Manual installation: stop Jellyfin, extract the [server ZIP](https://github.com/thehearthz/jellyfin-plugin-volume-guard/releases/download/v0.3.1.0/volume-guard-server-0.3.1.0.zip) into a `Volume Guard` folder in your server's configured plugins directory, and restart. [Releases and checksums](https://github.com/thehearthz/jellyfin-plugin-volume-guard/releases).
 
+## Plugin Pages integration
+
+With **Plugin Pages 3+** installed, Volume Guard registers a **Volume Guard** entry under Jellyfin web's **Plugin Settings** sidebar section. It opens the same listening controls, per-device settings, loudness analysis options and playback status as the dashboard page. Configuration and status still require a Jellyfin administrator account. This is a Jellyfin web integration; it does not inject a menu or button into the native Moonfin TV app.
+
+Install Jellyfin-12.2-compatible versions of **Plugin Pages** and its **File Transformation** dependency from the [upstream repository and installation guide](https://github.com/IAmParadox27/jellyfin-plugin-pages#installation), update Volume Guard to **0.3.1.0**, then restart Jellyfin and reload Jellyfin web. No manual page registration or config.json edit is needed. The integration is tested against the Plugin Pages **3.0.2.0** release for Jellyfin **12.2**.
+
+Plugin Pages is optional: **Dashboard → Plugins → Volume Guard** remains available without it. Playback status reports whether sidebar registration succeeded; this confirms registration, not that File Transformation successfully patched your web client. Actual deployment on a running server still needs validation.
 ## Listening modes and schedule
 
 - **Off:** normal Jellyfin playback negotiation, without the server audio filters.

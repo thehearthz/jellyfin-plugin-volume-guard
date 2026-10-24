@@ -20,6 +20,7 @@ public sealed class ServiceRegistrator : IPluginServiceRegistrator
     {
         services.AddSingleton<AnalysisService>();
         services.AddHostedService<PlaybackSwitchingService>();
+        services.AddHostedService<PluginPagesIntegration>();
         DecorateTranscodeManager(services);
         services.Configure<MvcOptions>(options => options.Filters.Add<VolumeGuardPlaybackFilter>());
     }

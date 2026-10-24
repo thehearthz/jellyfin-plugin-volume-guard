@@ -31,6 +31,7 @@
     <div class="content-primary vg-content">
         <h1>Volume Guard</h1>
         <p>Level audio on the Jellyfin server and keep your standard Moonfin player.</p>
+        <p class="vg-help">Administrator access is required to load or change these controls.</p>
         <p class="vg-notice">Server processing converts audio before sending it to your player. Video can remain unchanged where compatible. It uses server resources and replaces the original audio bitstream. Changes apply to new playback unless automatic switching is enabled below. This plugin cannot add buttons to Moonfin's player or preview screens.</p>
         <section class="vg-section" aria-labelledby="vg-processing-heading">
             <h2 id="vg-processing-heading">Playback status</h2>
@@ -39,6 +40,7 @@
             <p id="vg-status-error" role="alert" hidden></p>
             <div id="vg-sessions"></div>
             <p id="vg-analysis-status">Loudness analysis status has not loaded.</p>
+            <p id="vg-plugin-pages-status" class="vg-help" hidden></p>
         </section>
         <form id="vg-form">
             <fieldset id="vg-settings" disabled style="border:0;padding:0;margin:0">
@@ -91,9 +93,14 @@
     <script>
     (function () {
         'use strict';
-        var page = document.getElementById('volumeGuardPage');
+        // PluginPages appends a contextual fragment after its host view has already shown.
+        // Resolve this script's root so a retained Dashboard view cannot capture its controls.
+        var script = document.currentScript;
+        var page = script && script.closest('#volumeGuardPage') || document.getElementById('volumeGuardPage');
+        if (!page || page.dataset.vgInitialized === 'true') return;
+        page.dataset.vgInitialized = 'true';
         var $ = function (id) { return page.querySelector('#vg-' + id); };
-        var loaded = false, dirty = false, busy = false, windowId = 0, deviceRowId = 0, statusBusy = false;
+        var loaded = false, dirty = false, busy = false, windowId = 0, deviceRowId = 0, statusBusy = false, disposed = false;
         var dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
         var profileFields = [
             ['targetRmsDb', 'Target RMS (dBFS)', -40, -6], ['maxGainDb', 'Maximum gain (dB)', 0, 24],
@@ -173,18 +180,19 @@
             return config;
         }
         async function load() {
-            if (busy) return;
+            if (busy || disposed) return;
             if (dirty && !window.confirm('Discard unsaved Volume Guard changes and reload?')) return;
             setBusy(true); error(''); message('Loading settings…');
-            try { var config = await api('GET'); render(config); loaded = true; dirty = false; $('dirty').hidden = true; message('Settings loaded.'); }
+            try { var config = await api('GET'); if (disposed) return; render(config); loaded = true; dirty = false; $('dirty').hidden = true; message('Settings loaded.'); }
             catch (response) { message(loaded ? 'Your current values are still shown.' : 'Settings have not loaded.'); error(failure('Could not load settings.', response)); }
             finally { setBusy(false); }
         }
         function detail(value) { if (value == null) return 'Unavailable'; return typeof value === 'object' ? JSON.stringify(value) : String(value); }
         async function refreshStatus() {
-            if (statusBusy) return; statusBusy = true; $('refresh').disabled = true; $('status-error').hidden = true;
+            if (statusBusy || disposed) return; statusBusy = true; $('refresh').disabled = true; $('status-error').hidden = true;
             try {
-                var status = await api('GET', null, 'status'), devices = status.devices || []; $('sessions').replaceChildren(); $('known-devices').replaceChildren();
+                var status = await api('GET', null, 'status'); if (disposed) return;
+                var devices = status.devices || []; $('sessions').replaceChildren(); $('known-devices').replaceChildren();
                 if (!devices.length) $('sessions').appendChild(element('p', 'No active playback sessions reported. Start playback, then refresh.'));
                 devices.forEach(function (device) {
                     var option = element('option'); option.value = device.deviceId || ''; option.label = device.deviceName || device.client || ''; $('known-devices').appendChild(option);
@@ -197,6 +205,8 @@
                 });
                 var analysis = status.analysis || {}; $('analysis-status').textContent = analysis.summary || (typeof status.analysis === 'string' ? status.analysis : 'Loudness analysis: ' + detail(analysis.status || 'No analysis summary available.'));
                 if (analysis.lastError) $('analysis-status').appendChild(element('span', ' Last analysis error: ' + analysis.lastError));
+                $('plugin-pages-status').hidden = !status.pluginPages;
+                if (status.pluginPages) $('plugin-pages-status').textContent = 'Plugin Pages: ' + detail(status.pluginPages.status);
                 $('freshness').textContent = 'Updated ' + (status.serverTimeUtc ? new Date(status.serverTimeUtc).toLocaleString() : new Date().toLocaleString());
             } catch (response) { $('status-error').textContent = failure('Could not refresh playback status.', response); $('status-error').hidden = false; }
             finally { statusBusy = false; $('refresh').disabled = false; }
@@ -214,8 +224,14 @@
             catch (response) { message('Changes have not been saved. Your entries are still here.'); error(failure('Could not save settings.', response)); }
             finally { setBusy(false); }
         });
-        page.addEventListener('viewshow', function () { if (!loaded) { load(); refreshStatus(); } });
-        window.addEventListener('beforeunload', function (event) { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
+        function initialize() { if (!loaded && !disposed) { load(); refreshStatus(); } }
+        function beforeUnload(event) { if (dirty && page.isConnected && !disposed) { event.preventDefault(); event.returnValue = ''; } }
+        function cleanup() { disposed = true; dirty = false; window.removeEventListener('beforeunload', beforeUnload); observer.disconnect(); }
+        var observer = new MutationObserver(function () { if (!page.isConnected) cleanup(); });
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+        page.addEventListener('viewshow', initialize);
+        window.addEventListener('beforeunload', beforeUnload);
+        if (page.dataset.vgPluginPages === 'true') initialize();
     })();
     </script>
 </div></body></html>

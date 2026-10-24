@@ -10,11 +10,14 @@ At `StartFfMpeg`, the decorator selects the current profile and appends validate
 
 This relies on Jellyfin 12.2 registration order and MVC action/model contracts, so test against each future server release. Raw/static URLs and clients that bypass playback negotiation are outside this mechanism. Installation in a real server, physical Chromecast playback and actual Live TV tuner behavior remain unverified.
 
+Plugin Pages 3 support is optional and loaded through its documented reflection API. After Jellyfin startup, Volume Guard registers `/VolumeGuard/page`, an authenticated HTML fragment derived from the embedded settings page. It removes the nested router/document wrapper and initializes when Plugin Pages inserts it through a contextual fragment. No Plugin Pages or Newtonsoft DLL is bundled. The data APIs retain administrator authorization, and the normal dashboard entry remains available without Plugin Pages.
+
 ## API contract v1
 
 All routes use Jellyfin authentication. Configuration routes additionally require the `RequiresElevation` administrator policy. No route accepts user/device identity as authorization.
 
 - `GET /VolumeGuard/policy` returns schemaVersion, serverTimeUtc, enabled, defaultMode, effectiveAutoMode, scheduleActive and configuration.
+- `GET /VolumeGuard/page` returns the authenticated Plugin Pages shell. It contains no configuration or playback data; those are requested separately through protected APIs.
 - `GET /VolumeGuard/status` returns administrator-only device processing and analysis status. Confirmation requires the current playback-event token, matching title, matching encoder job and a recorded filter launch. No acoustic measurement is reported.
 - `GET /VolumeGuard/configuration` returns the configuration object.
 - `POST /VolumeGuard/configuration` validates and replaces the object through Jellyfin's XML plugin store, returning HTTP 204. The request limit is 32 KiB. Invalid input returns HTTP 400 ProblemDetails; invalid persisted policy returns HTTP 503.
@@ -62,4 +65,6 @@ Policy/DSP tests link the actual policy/filter sources. HTTP tests host actual p
 dotnet server/VolumeGuard.Tests/bin/Release/net10.0/VolumeGuard.Tests.dll /path/to/ffmpeg
 ```
 
-Output: `artifacts/volume-guard-server-0.3.0.0.zip`, containing only `Jellyfin.Plugin.VolumeGuard.dll` at its root. The settings HTML is embedded in the DLL. The build disables online NuGet vulnerability retrieval for reproducibility; dependency auditing is separate.
+Set `VOLUMEGUARD_FFMPEG` to a compatible FFmpeg executable to include real decoding tests in the build. Set `VOLUMEGUARD_PLUGIN_PAGES_ASSEMBLY` to the official Plugin Pages DLL built for Jellyfin 12.2 to include its real registration/startup compatibility tests. These optional test inputs are not bundled with the plugin.
+
+Output: `artifacts/volume-guard-server-0.3.1.0.zip`, containing only `Jellyfin.Plugin.VolumeGuard.dll` at its root. The settings HTML is embedded in the DLL. The build disables online NuGet vulnerability retrieval for reproducibility; dependency auditing is separate.

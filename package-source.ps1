@@ -1,4 +1,4 @@
-param([string]$Version = '0.3.0.0')
+param([string]$Version = '0.3.1.0')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw 'Version must have four numeric parts.' }
 Add-Type -AssemblyName System.IO.Compression

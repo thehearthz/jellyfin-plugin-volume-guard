@@ -11,11 +11,18 @@ const html = readFileSync(resolve(import.meta.dirname, '../server/VolumeGuard/We
 const config = { enabled: true, defaultMode: 'Auto', daytimeMode: 'Balanced', timeZoneId: 'America/New_York', scheduleEnabled: true, nightWindows: [{ days: [0,1,2,3,4,5,6], start: '22:00', end: '07:00' }], balanced: { targetRmsDb: -20, maxGainDb: 6, limiterCeilingDb: -1, attackMs: 10, releaseMs: 500 }, night: { targetRmsDb: -26, maxGainDb: 9, limiterCeilingDb: -4, attackMs: 5, releaseMs: 800 } };
 // Preview-only approximation of the host dashboard's inherited styles, never shipped with the plugin.
 const hostStyle = `<style>body{margin:0;background:#101010;color:#eee;font:16px Arial,sans-serif}input,select{background:#252525;color:inherit;border:1px solid #777;padding:.5em}button{background:#333;border:0;color:inherit;padding:.7em 1em;cursor:pointer}button[type=submit]{background:#007a9f;color:#fff}button:disabled{opacity:.5}#vg-error{color:#ffafaf}summary{font-weight:600}fieldset{color:inherit}h1,h2{font-weight:600}</style>`;
-const playbackStatus = {serverTimeUtc:'2026-10-24T12:00:00Z',devices:[{deviceId:'chromecast-id',deviceName:'Bedroom Chromecast',client:'Moonfin',mode:'Night',processing:true,reason:'Audio filter launched.',dialogue:'3 dB',analysis:'Cached title measurement'}],analysis:{summary:'1 title measured.'}};
+const playbackStatus = {serverTimeUtc:'2026-10-24T12:00:00Z',devices:[{deviceId:'chromecast-id',deviceName:'Bedroom Chromecast',client:'Moonfin',mode:'Night',processing:true,reason:'Audio filter launched.',dialogue:'3 dB',analysis:'Cached title measurement'}],analysis:{summary:'1 title measured.'},pluginPages:{registered:true,status:'Registered with Plugin Pages.'}};
 const mock = `<script>window.requests=[];window.failGet=0;window.failStatus=0;window.failPost=0;window.saved=null;window.ApiClient={getUrl:function(path){return '/jellyfin/'+path},ajax:async function(options){requests.push(options);if(options.url==='/jellyfin/VolumeGuard/status'){if(failStatus)throw{status:failStatus};return ${JSON.stringify(playbackStatus)}}if(options.url!=='/jellyfin/VolumeGuard/configuration')throw new Error('Base path lost');if(options.type==='GET'){if(failGet)throw{status:failGet};return ${JSON.stringify(config)}}if(failPost)throw{status:failPost};saved=JSON.parse(options.data);}};</script>`;
 const preview = html.replace('</head>', hostStyle + mock + '</head>').replace('</body>', `<script>document.getElementById('volumeGuardPage').dispatchEvent(new Event('viewshow'));</script></body>`);
 writeFileSync(resolve(out, 'preview.html'), preview);
-const server = createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(preview); });
+// Match the server's body-fragment transform and PluginPages' actual contextual-fragment loader.
+const fragment = html.match(/<body>([\s\S]*)<\/body>/i)[1].replace('data-role="page" class="page type-interior pluginConfigurationPage"', 'data-vg-plugin-pages="true"');
+const fragmentLiteral = JSON.stringify(fragment).replace(/</g, '\\u003c');
+const fragmentMock = mock.replace("if(options.url==='/jellyfin/VolumeGuard/status')", "if(options.url==='/jellyfin/VolumeGuard/page')return window.fragmentSource;if(options.url==='/jellyfin/VolumeGuard/status')");
+const fragmentHost = `<!DOCTYPE html><html><head><meta charset="utf-8">${hostStyle}${fragmentMock}</head><body><div id="volumeGuardPage"><input id="vg-zone" value="retained-dashboard"></div><div class="userPreferencesPage"><div class="userPluginSettingsContainer"></div></div><script>
+window.fragmentSource=${fragmentLiteral};window.unloadListeners=new Set();const add=window.addEventListener.bind(window),remove=window.removeEventListener.bind(window);window.addEventListener=function(type,listener,options){if(type==='beforeunload')unloadListeners.add(listener);return add(type,listener,options)};window.removeEventListener=function(type,listener,options){if(type==='beforeunload')unloadListeners.delete(listener);return remove(type,listener,options)};
+window.mountVolumeGuard=async function(){let container=document.querySelector('.userPluginSettingsContainer');let response=await ApiClient.ajax({type:'GET',url:ApiClient.getUrl('VolumeGuard/page')});const fragment=document.createRange().createContextualFragment(response);container.append(fragment);};</script></body></html>`;
+const server = createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(req.url === '/fragment-host' ? fragmentHost : preview); });
 await new Promise(r => server.listen(0, '127.0.0.1', r));
 const browser = await Browser.launch();
 try {
@@ -35,6 +42,7 @@ try {
   assert.equal(await page.eval(() => document.getElementById('vg-zone').value), 'Europe/London');
   assert.equal(await page.eval(() => document.getElementById('vg-dirty').hidden), false);
   assert.match(await page.eval(() => document.getElementById('vg-sessions').textContent), /Bedroom Chromecast.*Processing launched/s);
+  assert.match(await page.eval(() => document.getElementById('vg-plugin-pages-status').textContent), /Registered with Plugin Pages/);
   assert.equal(await page.eval(() => document.querySelector('#vg-known-devices option').value), 'chromecast-id');
   // New controls and per-device overrides round-trip through the same explicit Save.
   await page.eval(() => {
@@ -78,6 +86,29 @@ try {
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   await page.eval(() => { failGet=503; document.getElementById('vg-reload').click(); });
   assert.match(await page.eval(() => document.getElementById('vg-error').textContent), /Could not load/);
+  // PluginPages never forwards viewshow to the appended fragment. It must initialize on insertion.
+  await page.goto(`http://127.0.0.1:${server.address().port}/fragment-host`);
+  await page.eval(() => mountVolumeGuard());
+  assert.equal(await page.eval(() => document.querySelector('.userPluginSettingsContainer #vg-zone').value), config.timeZoneId);
+  assert.equal(await page.eval(() => document.querySelector('.userPluginSettingsContainer #vg-save').disabled), false);
+  assert.equal(await page.eval(() => document.querySelector('#volumeGuardPage #vg-zone').value), 'retained-dashboard', 'fragment must not bind retained Dashboard controls');
+  assert.equal(await page.eval(() => unloadListeners.size), 1);
+  await page.eval(() => {const root=document.querySelector('.userPluginSettingsContainer');let input=root.querySelector('#vg-dialogue');input.value='6';input.dispatchEvent(new Event('input',{bubbles:true}));root.querySelector('#vg-form').requestSubmit();});
+  assert.equal(await page.eval(() => saved.dialogueBoostDb), 6);
+  assert.equal(await page.eval(() => requests.at(-1).url), '/jellyfin/VolumeGuard/configuration');
+  await page.eval(() => {const input=document.querySelector('.userPluginSettingsContainer #vg-zone');input.value='UTC';input.dispatchEvent(new Event('input',{bubbles:true}));});
+  assert.equal(await page.eval(() => {const event=new Event('beforeunload',{cancelable:true});window.dispatchEvent(event);return event.defaultPrevented;}), true);
+  await page.eval(async () => {document.querySelector('.userPluginSettingsContainer').replaceChildren();await Promise.resolve();});
+  assert.equal(await page.eval(() => unloadListeners.size), 0, 'removed fragment releases global lifecycle handler');
+  assert.equal(await page.eval(() => {const event=new Event('beforeunload',{cancelable:true});window.dispatchEvent(event);return event.defaultPrevented;}), false, 'detached dirty fragment cannot request unload confirmation');
+  await page.eval(() => {failGet=403;return mountVolumeGuard();});
+  assert.equal(await page.eval(() => document.querySelector('.userPluginSettingsContainer #vg-settings').disabled), true);
+  assert.equal(await page.eval(() => document.querySelector('.userPluginSettingsContainer #vg-save').disabled), true);
+  assert.match(await page.eval(() => document.querySelector('.userPluginSettingsContainer #vg-error').textContent), /administrator/);
+  assert.equal(await page.eval(() => unloadListeners.size), 1, 'remount has one global lifecycle handler');
+  assert.equal(await page.eval(() => requests.filter(r=>r.type==='POST').length), 1, 'unauthorized mount never writes configuration');
+  await page.eval(async () => {document.querySelector('.userPluginSettingsContainer').replaceChildren();await Promise.resolve();});
+  assert.equal(await page.eval(() => unloadListeners.size), 0);
   assert.deepEqual(page.consoleErrors, []);
-  console.log('PASS: settings/status URLs, 204 save, dialogue/analysis/switch fields, device overrides and duplicate validation, refresh preserves unsaved edits and last good status, overnight windows, admin failures, responsive widths; no browser exceptions.');
+  console.log('PASS: Dashboard and PluginPages contextual-fragment load/save, retained-view isolation, unauthorized mount, remount lifecycle cleanup, status diagnostic, reverse-proxy paths, existing configuration/status/error/responsive checks; no browser exceptions.');
 } finally { await browser.close(); server.close(); }

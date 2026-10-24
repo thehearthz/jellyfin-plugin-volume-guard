@@ -1,4 +1,4 @@
-param([switch]$ServerOnly, [switch]$LegacyCompanion, [switch]$SkipTests, [string]$Version = '0.3.0.0')
+param([switch]$ServerOnly, [switch]$LegacyCompanion, [switch]$SkipTests, [string]$Version = '0.3.1.0')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw 'Version must have four numeric parts.' }
 Set-Location $PSScriptRoot
@@ -20,7 +20,7 @@ if (!$SkipTests) {
     if ($LASTEXITCODE -ne 0) { throw 'HTTP test build failed.' }
     & $dotnetCommand server/VolumeGuard.HttpTests/bin/Release/net10.0/VolumeGuard.HttpTests.dll
     if ($LASTEXITCODE -ne 0) { throw 'HTTP tests failed.' }
-    foreach ($suite in @('Switching', 'Analysis')) {
+    foreach ($suite in @('Switching', 'Analysis', 'PluginPages')) {
         & $dotnetCommand build "server/VolumeGuard.${suite}Tests/VolumeGuard.${suite}Tests.csproj" -c Release -p:NuGetAudit=false
         if ($LASTEXITCODE -ne 0) { throw "$suite test build failed." }
         & $dotnetCommand "server/VolumeGuard.${suite}Tests/bin/Release/net10.0/VolumeGuard.${suite}Tests.dll"
