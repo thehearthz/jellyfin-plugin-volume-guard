@@ -1,6 +1,8 @@
-# Volume Guard — experimental preview 0.1
+# Volume Guard — experimental server plugin 0.2
 
-Volume leveling and automatic night listening for **Jellyfin Server 12.2** and a **Chromecast with Google TV** using its remote. This project contains a server plugin and a separate Android TV companion app based on Jellyfin Android TV v0.19.10 (commit `984181a`). Both are built; testing on a physical Chromecast is still required.
+Audio leveling, peak limiting and scheduled night listening for **Jellyfin Server 12.2**, designed to work with **standard Moonfin 2.6.0 on Chromecast with Google TV**. Version 0.2 processes audio on the server. No companion app is required.
+
+The plugin builds against Jellyfin's real 12.2 packages and has automated negotiation, configuration and audio-filter checks. Installation and playback on a running Jellyfin server and physical Chromecast, including a real Live TV feed, remain unverified. Treat this release as an experimental preview.
 
 ## Install
 
@@ -10,67 +12,60 @@ Volume leveling and automatic night listening for **Jellyfin Server 12.2** and a
    https://raw.githubusercontent.com/thehearthz/jellyfin-plugin-volume-guard/main/manifest.json
    ```
 
-2. Open **Dashboard → Plugins → Catalog**, select **Volume Guard**, install version **0.1.0.0**, and restart Jellyfin.
-3. As an administrator, open **Dashboard → Plugins → Volume Guard**. Set the time zone to **America/New_York** if appropriate, choose your night hours, and save. The initial server time zone is **UTC**; change it before relying on the schedule.
-4. Download the [Chromecast companion APK](https://github.com/thehearthz/jellyfin-plugin-volume-guard/releases/download/v0.1.0.0/volume-guard-tv-0.1.0-debug.apk) and transfer it to your Chromecast using your preferred file-transfer or sideloading tool. Allow that tool to install unknown apps when Google TV requests it, then install the APK.
-5. Open **Volume Guard TV (Preview)** and sign in to your Jellyfin server. It installs alongside the regular Jellyfin app with package ID `org.jellyfin.androidtv.volumeguard`; use the preview app for processed playback.
-6. Play a movie, show, or Live TV channel with the built-in player. Show the player controls with the remote and select the **Volume Guard** audio icon in the secondary controls. Choose **Off**, **Balanced**, **Night**, or **Auto**.
+2. Open **Dashboard → Plugins → Catalog**, install **Volume Guard 0.2.0.0**, and restart Jellyfin. Existing 0.1 users should update the plugin and restart.
+3. As an administrator, open **Dashboard → Plugins → Volume Guard**. Turn on both **Enable Volume Guard** and **Process audio on the Jellyfin server**. Server processing starts disabled, so installation alone does not alter playback.
+4. Choose **Balanced**, **Night**, or **Auto**. For Auto, set your time zone and night hours. The initial time zone is **UTC**; use **America/New_York** if appropriate.
+5. Save, then start new playback in your existing Moonfin app. The Jellyfin user must have permission to transcode audio. For changes during playback, stop playback completely and start a new playback session.
 
-The stock Jellyfin app does not gain a button from the server plugin. The APK is an experimental, locally debug-signed build, not an official Jellyfin release. The Jellyfin catalog installs only the server DLL; install the companion APK separately. No server or device was modified during development.
+To turn processing off before a movie or show, use the master switch or select **Off** in the plugin settings, save, then begin playback. These controls apply globally to users of this server. A Jellyfin plugin cannot add a button to stock Moonfin's player or show/movie preview screen; those controls would require a Moonfin app change.
 
-Manual server installation is also available: stop Jellyfin, extract the [server plugin ZIP](https://github.com/thehearthz/jellyfin-plugin-volume-guard/releases/download/v0.1.0.0/volume-guard-server-0.1.0.0.zip) into a `Volume Guard` folder inside the server's configured plugins directory, and restart Jellyfin. [Releases and checksums](https://github.com/thehearthz/jellyfin-plugin-volume-guard/releases).
+Manual installation: stop Jellyfin, extract the [server ZIP](https://github.com/thehearthz/jellyfin-plugin-volume-guard/releases/download/v0.2.0.0/volume-guard-server-0.2.0.0.zip) into a `Volume Guard` folder in your server's configured plugins directory, and restart. [Releases and checksums](https://github.com/thehearthz/jellyfin-plugin-volume-guard/releases).
 
-## Listening controls
+## Listening modes and schedule
 
-- **Off:** bypass gain processing. The companion still decodes audio to PCM so switching modes does not restart playback.
-- **Balanced:** gently brings quiet and loud passages toward a target level, with capped gain and a final linked sample-peak limiter.
-- **Night:** a quieter target and lower peak ceiling to reduce sudden loud passages.
-- **Auto:** selects Night inside configured night windows and the configured daytime mode otherwise.
-- **Settings…:** shows the selected/effective mode and policy connection status. You can optionally use a daily night schedule local to this TV instead of the server's weekly schedule.
+- **Off:** normal Jellyfin playback negotiation, without the server audio filters.
+- **Balanced:** streaming volume leveling, capped boost, compression and sample-peak limiting.
+- **Night:** a quieter target, stronger compression and a lower peak ceiling.
+- **Auto:** selects Night inside your weekly night windows, and your selected daytime mode otherwise.
 
-Player selection is remembered separately for each server and Jellyfin user on the device. Selecting a manual mode overrides Auto until you select Auto again. Changing the server's default mode applies to devices without a saved selection. The server's master Enable setting overrides all client modes after the next policy refresh.
+Schedule days identify the **start day**: Friday 22:00–07:00 includes Saturday morning. Start is inclusive; end is exclusive. Multiple windows, overnight hours and daylight-saving changes are supported.
 
-Weekly schedule days identify the **start day**: Friday 22:00–07:00 includes Saturday morning. Start is inclusive; end is exclusive. Overnight windows, multiple windows, and daylight-saving changes are supported. Auto evaluates every 15 seconds during playback; server policy refreshes every 60 seconds. If an Android-unrecognized server time-zone name is used, the client follows the server's evaluated mode on each policy refresh. Prefer an IANA name such as `America/New_York`.
+The mode is selected when an FFmpeg conversion starts. An existing stream does **not** switch profiles at the schedule boundary or after a settings change. Stop and begin a new playback session to apply the current mode; seeking alone may reuse the existing conversion.
 
-If the server plugin is unavailable, the companion retains saved policy or uses local defaults: Balanced during the day and Night at 22:00–07:00 in the TV's time zone. The settings dialog reports the connection failure. A local daily schedule uses the TV's clock and time zone; keep those accurate. Offline clients cannot receive new server settings until reconnection.
-
-## Audio behavior and limits
-
-Audio processing runs on decoded PCM in the built-in TV player. It uses streaming RMS measurement, gradual linked-channel gain, a silence gate that stops gain chasing during quiet gaps, capped boost, and sample-peak protection. It does not rewrite media files, scan the entire library, or require a custom Jellyfin server binary. Movies, episodes and Live TV share this processing path, including library items that Direct Play to the companion.
-
-**Audio passthrough and offload are disabled throughout the companion, including Off mode.** Atmos/DTS bitstream passthrough and its object metadata are therefore unavailable. Surround PCM support depends on the Chromecast, display and receiver. Video follows the normal Jellyfin playback negotiation; the audio processor itself does not force video transcoding. Unsupported codecs may still need normal server transcoding.
-
-The DSP works on 16-bit PCM. Non-16-bit decoded audio uses the player's normal conversion before the custom processor; float output is disabled. External players, casting, the stock TV app, other apps and the newer experimental playback backend are outside this integration. Use the built-in player in the preview.
-
-Targets are **RMS dBFS, not measured LUFS**. Streaming leveling takes time to adapt, so it cannot make all content perceptually identical. The limiter caps digital sample peaks, not intersample true peaks or physical room volume. Volume at the TV/receiver still matters. No separate dialogue enhancement or whole-file loudness analysis is included in this preview.
-
-Default profiles:
+Default profiles are editable in the plugin settings:
 
 | Setting | Balanced | Night |
 | --- | ---: | ---: |
 | RMS target | −20 dBFS | −26 dBFS |
 | Maximum boost | +6 dB | +9 dB |
-| Sample-peak ceiling | −1 dBFS | −4 dBFS |
-| Gain-reduction attack | 10 ms | 5 ms |
-| Gain-increase release | 500 ms | 800 ms |
+| Filter sample-peak ceiling | −1 dBFS | −4 dBFS |
+| Compressor attack | 10 ms | 5 ms |
+| Compressor release | 500 ms | 800 ms |
 
-## Verification
+## How processing works
 
-- Server plugin compiles against the real Jellyfin 12.2 packages on .NET 10.
-- 43 policy/validation/JSON checks cover timezone offsets, overnight windows, selected start days, DST, malformed times, and profile bounds.
-- 17 HTTP checks use the actual compiled controller, a local test host and a test authentication handler: anonymous/regular-user/admin access, rejected writes, configuration persistence/reload, and invalid external configuration.
-- JVM audio checks cover 8/48/192 kHz, stereo/six channels, first-frame and sudden-peak limiting, gain caps, linked channel balance, silence, nonfinite input and bypass. JVM schedule checks cover day attribution, end boundaries, week wrap and DST.
-- A real local browser checks the embedded settings page using a mocked Jellyfin API, including save responses, reverse-proxy paths, failed authentication, unsaved edits, validation, and widths 1440/768/390.
-- Android debug APK compilation and signature verification are recorded with the release artifacts.
+During authenticated playback negotiation, the plugin requests audio transcoding and removes direct-play choices from the response. It adds FFmpeg `dynaudnorm`, `acompressor` and `alimiter` filters when the conversion starts. Video can be copied when compatible; normal codec and subtitle requirements may still cause video transcoding. Media files are not modified, and no library scan is required.
 
-**Not verified:** installation in a running Jellyfin server, audio routing/audibility on a physical Chromecast, remote focus behavior on the TV, or playback of a real Live TV feed. Before routine use, compare Off/Balanced/Night on familiar content at a low TV volume, test a channel change and seek, and confirm Auto changes at your configured boundary. These device checks remain necessary despite the successful automated checks.
+Library playback and Live TV use the same server conversion hook. Live TV negotiation suppresses the raw source path in the response so Moonfin can use the processed URL. When no supported transcoding route is available, negotiation returns an error rather than offering an unprocessed direct-play route. This behavior still needs real-device and tuner testing.
 
-## Build and source
+Processing consumes server CPU and can add about a second of buffering. Encoded audio replaces the original bitstream, so original Atmos/DTS object metadata is not preserved. Channel support follows the negotiated output codec and device capabilities. Audio transcoding permission is required.
 
-`build.ps1` builds the DLL and debug APK and runs server and JVM tests. It uses .NET 10, Java 21, Android SDK 36, and the upstream Gradle wrapper. `-ServerOnly` builds just the plugin. The task-local `.build-tools` directory is a development convenience and is excluded from source distribution; on another machine configure `JAVA_HOME` and `ANDROID_HOME`. Dependency downloads require network access.
+Targets are **RMS dBFS, not measured LUFS**. Streaming gain adapts over time and cannot make all programs perceptually identical. The limiter controls sample peaks before encoding; lossy encoding can produce output peaks above that ceiling. It does not limit intersample true peaks or physical room volume.
 
-The server endpoints are authenticated `GET /VolumeGuard/policy` and administrator-only `GET/POST /VolumeGuard/configuration`. API paths are appended to the configured server address, preserving a reverse-proxy base path. Configuration is stored by Jellyfin's plugin XML persistence. No scheduled server worker, audio scan, background transcoder or device tracking is added.
+Clients or external players that bypass Jellyfin playback negotiation, offline files and raw/static media URLs are outside this mechanism. Do not combine server processing with the old Volume Guard companion's DSP: that would process audio twice.
 
-The Android source retains upstream licensing and notices. Android TV fork changes are in `app/.../volumeguard`, the Volume Guard player action/icon, playback glue, renderer setup and preview app identity. Server source is under `server/`. SHA-256 hashes are in `artifacts/SHA256SUMS`.
+## Verification and source
 
-Upstream references: [Jellyfin server 12.2](https://github.com/jellyfin/jellyfin/releases/tag/v12.2), [Jellyfin Android TV v0.19.10](https://github.com/jellyfin/jellyfin-androidtv/tree/v0.19.10), [Media3 AudioSink](https://github.com/androidx/media/blob/1.8.0/libraries/exoplayer/src/main/java/androidx/media3/exoplayer/audio/DefaultAudioSink.java).
+Automated checks cover schedule boundaries/DST, configuration validation, authenticated API access, persistence, playback and Live TV response rewriting, DI decoration, FFmpeg command interception, and filter construction. Real FFmpeg PCM checks verify capped quiet-content boost, peak reduction and silence preservation. The settings page is checked in a real browser with a mocked Jellyfin API at desktop and mobile widths. Physical server/client playback is still required to establish compatibility.
+
+Build the server plugin and run its tests with .NET 10:
+
+```powershell
+./build.ps1 -ServerOnly
+```
+
+The ZIP contains `Jellyfin.Plugin.VolumeGuard.dll` at its root. Jellyfin dependencies are supplied by the server. `scripts/update-manifest.ps1` updates the catalog checksum after a build; `package-source.ps1` creates a source archive. Release assets include SHA-256 checksums; Jellyfin's catalog uses MD5.
+
+Server source is under `server/`; see [server API and integration details](server/README.md). Historical Android TV companion source and the Moonfin patch experiment are retained for reference. Neither is required or distributed as part of the 0.2 server installation. The default build produces only the server; `-LegacyCompanion` explicitly builds the old Android preview.
+
+Upstream sources: [Jellyfin 12.2](https://github.com/jellyfin/jellyfin/tree/v12.2), [FFmpeg audio filters](https://ffmpeg.org/ffmpeg-filters.html).

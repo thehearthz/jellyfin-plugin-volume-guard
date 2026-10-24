@@ -1,5 +1,5 @@
 param(
-    [string]$Version = '0.1.0.0',
+    [string]$Version = '0.2.0.0',
     [string]$Repository = 'thehearthz/jellyfin-plugin-volume-guard'
 )
 $ErrorActionPreference = 'Stop'
@@ -13,13 +13,13 @@ $previous = if (Test-Path -LiteralPath $manifestPath) { @(Get-Content -LiteralPa
 $entry = [ordered]@{
     guid = 'c49aef32-6c2e-462c-a5ee-40e18c8d28af'
     name = 'Volume Guard'
-    overview = 'Volume profiles and automatic night schedules for the Volume Guard TV companion'
-    description = 'Experimental companion settings plugin for Jellyfin 12.2. Provides Balanced/Night profiles and weekly schedules. Requires the separately installed Volume Guard Android TV companion for audio leveling, peak limiting, and player controls. Stock Jellyfin clients do not process audio from this plugin alone.'
+    overview = 'Server audio leveling, peak limiting and automatic night profiles'
+    description = 'Experimental server audio processing for Jellyfin 12.2 and standard clients such as Moonfin. Enable server processing in the plugin settings; audio is converted while video can be copied where compatible. Includes a manual switch, Balanced/Night modes and weekly schedules. Changes apply to new playback. No companion app is required for the server route; Direct Play outside playback negotiation bypasses processing. Physical client and Live TV validation remains necessary.'
     owner = $Repository.Split('/')[0]
     category = 'General'
     versions = @([ordered]@{
         version = $Version
-        changelog = 'Initial experimental release: shared audio profiles, timezone-aware weekly night schedules, administrator configuration, and authenticated companion policy API. Install the Android TV companion separately for actual audio processing and player toggles. Physical Chromecast and Live TV playback validation remains necessary.'
+        changelog = 'Adds opt-in server audio processing for standard Moonfin: requests audio conversion at playback negotiation, applies leveling and peak limiting in FFmpeg, and keeps video copying available where compatible. Manual on/off, Balanced/Night/Auto and weekly schedules are in Jellyfin plugin settings. Restart playback after changes. No companion app or Moonfin preview-screen/player button is required. Validate on a real server and Chromecast before relying on it.'
         targetAbi = '12.2.0.0'
         sourceUrl = "https://github.com/$Repository/releases/download/v$Version/volume-guard-server-$Version.zip"
         checksum = (Get-FileHash -LiteralPath $archive -Algorithm MD5).Hash.ToLowerInvariant()

@@ -5,6 +5,7 @@ namespace Jellyfin.Plugin.VolumeGuard;
 
 public sealed class Configuration : BasePluginConfiguration
 {
+    [JsonPropertyName("serverProcessingEnabled")] public bool ServerProcessingEnabled { get; set; }
     [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
     [JsonPropertyName("defaultMode")] public string DefaultMode { get; set; } = "Auto";
     [JsonPropertyName("daytimeMode")] public string DaytimeMode { get; set; } = "Balanced";

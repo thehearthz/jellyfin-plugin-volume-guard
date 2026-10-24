@@ -8,5 +8,6 @@ artifacts/
 **/local.properties
 **/node_modules/
 ui-tests/screenshots/
+ui-tests/settings-*.png
 androidtv-source/.git
 moonfin-source/

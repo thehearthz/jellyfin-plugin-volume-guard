@@ -1,11 +1,13 @@
+param([string]$Version = '0.2.0.0')
 $ErrorActionPreference = 'Stop'
+if ($Version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw 'Version must have four numeric parts.' }
 Add-Type -AssemblyName System.IO.Compression
 $root = $PSScriptRoot
-$archivePath = Join-Path $root 'artifacts/volume-guard-source-0.1.0.zip'
+$archivePath = Join-Path $root "artifacts/volume-guard-source-$Version.zip"
 New-Item -ItemType Directory -Force -Path (Join-Path $root 'artifacts') | Out-Null
 $stream = [IO.File]::Open($archivePath, [IO.FileMode]::Create)
 $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create)
-$excluded = @('.git', '.build-tools', 'artifacts', 'bin', 'obj', 'build', '.gradle', '.kotlin', 'classes', 'node_modules')
+$excluded = @('.git', '.build-tools', 'moonfin-source', 'artifacts', 'bin', 'obj', 'build', '.gradle', '.kotlin', 'classes', 'node_modules')
 function Add-SourceFolder([string]$folder) {
     foreach ($item in Get-ChildItem -LiteralPath $folder -Force) {
         if ($item.Name -in $excluded) { continue }

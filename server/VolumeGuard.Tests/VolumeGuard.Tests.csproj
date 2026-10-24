@@ -3,5 +3,6 @@
   <ItemGroup>
     <Compile Include="../VolumeGuard/Configuration.cs" Link="Configuration.cs" />
     <Compile Include="../VolumeGuard/Policy.cs" Link="Policy.cs" />
+    <Compile Include="../VolumeGuard/ServerAudio.cs" Link="ServerAudio.cs" />
   </ItemGroup>
 </Project>

@@ -1,5 +1,7 @@
 # Moonfin 2.6.0 + Volume Guard preview
 
+**Historical app experiment:** Version 0.2 provides server processing for standard Moonfin without this modified app. Follow the [main installation instructions](../../README.md). Do not combine this app's DSP with server processing.
+
 This integration keeps Moonfin's interface and adds Volume Guard to the Android TV Media3 player. It targets **Moonfin 2.6.0**, exact upstream commit `b86bbe6021eff5befdf311134bf3e831c032f21f`. It is a modified preview, not an official Moonfin release; the unmodified app does not call the Volume Guard policy API.
 
 The existing Volume Guard Jellyfin 12.2 plugin supplies profiles and schedules without a server-plugin upgrade. A Volume Guard button in both the movie/show controls and Live TV controls opens Off, Balanced, Night, and Auto. Modes are remembered per server, user, and TV. Auto checks the schedule every 15 seconds; policy settings refresh every 60 seconds. Offline playback uses the last valid policy or a 22:00–07:00 TV-local default.

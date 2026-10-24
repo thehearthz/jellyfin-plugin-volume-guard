@@ -8,6 +8,12 @@ using System.Xml.Serialization;
 using Jellyfin.Plugin.VolumeGuard;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Model.Serialization;
+using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Streaming;
+using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.MediaInfo;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
@@ -24,7 +30,10 @@ builder.Logging.ClearProviders();
 builder.WebHost.UseUrls("http://127.0.0.1:0");
 builder.Services.AddAuthentication("Test").AddScheme<AuthenticationSchemeOptions, TestAuthentication>("Test", _ => { });
 builder.Services.AddAuthorization(options => options.AddPolicy("RequiresElevation", policy => policy.RequireAuthenticatedUser().RequireRole("Admin")));
-builder.Services.AddControllers().AddApplicationPart(typeof(VolumeGuardController).Assembly);
+builder.Services.AddControllers(options => options.Filters.Add<VolumeGuardPlaybackFilter>()).AddApplicationPart(typeof(VolumeGuardController).Assembly);
+var originalManager = DispatchProxy.Create<ITranscodeManager, TranscodeProxy>();
+builder.Services.AddSingleton(originalManager);
+ServiceRegistrator.DecorateTranscodeManager(builder.Services);
 await using var app = builder.Build();
 app.UseAuthentication();
 app.UseAuthorization();
@@ -67,6 +76,37 @@ Check((await adminRead.Content.ReadAsStringAsync()).Contains("\"daytimeMode\":\"
 // Jellyfin's generic plugin endpoint can bypass the custom validation. Fail policy safely.
 Plugin.Instance.UpdateConfiguration(new Configuration { TimeZoneId = "Bad/Zone" });
 Check((await Request(HttpMethod.Get, "/VolumeGuard/policy", "User")).StatusCode == HttpStatusCode.ServiceUnavailable, "Invalid external configuration produces 503");
+Plugin.Instance.UpdateConfiguration(new Configuration());
+var originalPlayback = await Request(HttpMethod.Post, "/test/playback?enableDirectPlay=true&allowAudioStreamCopy=true&allowVideoStreamCopy=false", "User", new TestPlaybackBody());
+Check((await originalPlayback.Content.ReadAsStringAsync()).Contains("query=True;audio=True;video=False"), "Disabled plugin preserves all playback negotiation");
+Plugin.Instance.UpdateConfiguration(new Configuration { ServerProcessingEnabled = true, DefaultMode = "Balanced" });
+var processedPlayback = await Request(HttpMethod.Post, "/test/playback?enableDirectPlay=true&allowAudioStreamCopy=true&allowVideoStreamCopy=false", "User", new TestPlaybackBody());
+var processedJson = JsonDocument.Parse(await processedPlayback.Content.ReadAsStringAsync());
+var processedSource = processedJson.RootElement.GetProperty("mediaSources")[0];
+Check(processedSource.GetProperty("name").GetString() == "query=False;audio=False;video=False", "Query/body precedence overridden without changing video copy");
+Check(!processedSource.GetProperty("supportsDirectPlay").GetBoolean() && !processedSource.GetProperty("supportsDirectStream").GetBoolean(), "Stock client receives no direct route");
+Check(processedSource.GetProperty("path").ValueKind == JsonValueKind.Null, "Moonfin raw live URL bypass suppressed");
+Check(processedSource.GetProperty("transcodingUrl").GetString()!.Contains("allowAudioStreamCopy=false"), "Encoding URL prohibits audio copy");
+Check(MediaInfoController.Source.Path == "https://upstream.example/live.ts" && MediaInfoController.Source.SupportsDirectPlay, "Shared server source remains intact");
+var bodyOnly = await Request(HttpMethod.Post, "/test/playback", "User", new TestPlaybackBody());
+Check((await bodyOnly.Content.ReadAsStringAsync()).Contains("query=False;audio=False;video="), "Body only negotiation cannot reenable direct play/audio copy");
+Check((await Request(HttpMethod.Post, "/test/live", "User")).StatusCode == HttpStatusCode.OK, "Live stream response sanitized without shared mutation");
+Check((await Request(HttpMethod.Post, "/test/unsupported", "User")).StatusCode == HttpStatusCode.Conflict, "No permitted encoding route fails instead of Moonfin terminal direct fallback");
+Check((await Request(HttpMethod.Post, "/test/playback")).StatusCode == HttpStatusCode.Unauthorized, "Playback filter retains authentication requirement");
+var manager = app.Services.GetRequiredService<ITranscodeManager>();
+Check(manager is VolumeGuardTranscodeManager, "Jellyfin manager descriptor decorated through real DI");
+manager.PingTranscodingJob("test", true);
+Check(((TranscodeProxy)(object)originalManager).LastMethod == "PingTranscodingJob", "Lifecycle call delegated");
+using var cancel = new CancellationTokenSource();
+var state = new StreamState(null!, TranscodingJobType.Hls, manager) { Request = new VideoRequestDto { PlaySessionId = "test" }, AudioStream = new MediaBrowser.Model.Entities.MediaStream(), OutputAudioCodec = "aac" };
+await manager.StartFfMpeg(state, "out", "-i in -c:v copy -c:a aac -af \"volume=1\" out", Guid.Empty, TranscodingJobType.Hls, cancel);
+Check(((TranscodeProxy)(object)originalManager).LastArguments![2]!.ToString()!.Contains("volume=1,dynaudnorm="), "DSP injected before real manager process launch");
+state.OutputAudioCodec = "copy";
+try { await manager.StartFfMpeg(state, "out", "-i in -c:a copy out", Guid.Empty, TranscodingJobType.Hls, cancel); throw new Exception("copy accepted"); }
+catch (InvalidOperationException) { checks++; }
+Plugin.Instance.UpdateConfiguration(new Configuration());
+await manager.StartFfMpeg(state, "out", "original args unchanged", Guid.Empty, TranscodingJobType.Hls, cancel);
+Check((string)((TranscodeProxy)(object)originalManager).LastArguments![2]! == "original args unchanged", "Disabled DSP passes exact original arguments");
 await app.StopAsync();
 Console.WriteLine($"PASS: {checks} HTTP authentication, authorization, validation, persistence and JSON checks.");
 
@@ -101,4 +141,33 @@ public class TestAuthentication : AuthenticationHandler<AuthenticationSchemeOpti
         var identity = new ClaimsIdentity([new Claim(ClaimTypes.Name, "test"), new Claim(ClaimTypes.Role, role.ToString())], "Test");
         return Task.FromResult(AuthenticateResult.Success(new AuthenticationTicket(new ClaimsPrincipal(identity), "Test")));
     }
+}
+
+public class TranscodeProxy : DispatchProxy
+{
+    public string? LastMethod { get; private set; }
+    public object?[]? LastArguments { get; private set; }
+    protected override object? Invoke(MethodInfo? method, object?[]? args)
+    {
+        LastMethod = method!.Name; LastArguments = args;
+        return method.Name == "StartFfMpeg" ? Task.FromResult<TranscodingJob>(null!) : null;
+    }
+}
+
+public sealed class TestPlaybackBody { public bool EnableDirectPlay { get; set; } = true; public bool AllowAudioStreamCopy { get; set; } = true; }
+[ApiController, Authorize]
+public sealed class MediaInfoController : ControllerBase
+{
+    public static MediaSourceInfo Source { get; } = new() { Id = "test", Path = "https://upstream.example/live.ts", LiveStreamId = "live", SupportsDirectPlay = true, SupportsDirectStream = true, SupportsTranscoding = true, TranscodingUrl = "/Videos/test/master.m3u8?AudioCodec=aac&allowAudioStreamCopy=true&Token=test" };
+    [HttpPost("/test/playback")]
+    public ActionResult<PlaybackInfoResponse> GetPostedPlaybackInfo([FromQuery] bool? enableDirectPlay, [FromQuery] bool? enableDirectStream, [FromQuery] bool? allowAudioStreamCopy, [FromQuery] bool? allowVideoStreamCopy, [FromBody] TestPlaybackBody? body)
+    {
+        var source = System.Text.Json.JsonSerializer.Deserialize<MediaSourceInfo>(System.Text.Json.JsonSerializer.Serialize(Source))!;
+        source.Name = $"query={enableDirectPlay ?? body?.EnableDirectPlay};audio={allowAudioStreamCopy ?? body?.AllowAudioStreamCopy};video={allowVideoStreamCopy}";
+        return new PlaybackInfoResponse { PlaySessionId = "test", MediaSources = [source] };
+    }
+    [HttpPost("/test/live")]
+    public ActionResult<LiveStreamResponse> OpenLiveStream([FromQuery] bool? enableDirectPlay, [FromQuery] bool? enableDirectStream) => new LiveStreamResponse(Source);
+    [HttpPost("/test/unsupported"), ActionName("GetPostedPlaybackInfo")]
+    public ActionResult<PlaybackInfoResponse> Unsupported([FromQuery] bool? enableDirectPlay, [FromQuery] bool? enableDirectStream, [FromQuery] bool? allowAudioStreamCopy) => new PlaybackInfoResponse { MediaSources = [new MediaSourceInfo { SupportsTranscoding = false }] };
 }

@@ -27,16 +27,18 @@
     </style>
     <div class="content-primary vg-content">
         <h1>Volume Guard</h1>
-        <p>Set shared listening profiles and a weekly night schedule for your companion TV player.</p>
-        <p class="vg-notice">Requires the Volume Guard Android TV companion. This plugin cannot add controls to the stock Jellyfin TV app. Audio processing runs in the companion player, where audio passthrough is disabled so audio can be processed. These settings do not indicate that processing is active.</p>
+        <p>Level audio on the Jellyfin server and keep your standard Moonfin player.</p>
+        <p class="vg-notice">Server processing converts audio before sending it to your player. Video can remain unchanged where compatible. It uses server resources and replaces the original audio bitstream. Change these settings before starting playback; active streams keep their existing processing. This plugin cannot add buttons to Moonfin's player or preview screens.</p>
         <form id="vg-form">
             <fieldset id="vg-settings" disabled style="border:0;padding:0;margin:0">
                 <section class="vg-section" aria-labelledby="vg-playback-heading">
-                    <h2 id="vg-playback-heading">Playback defaults</h2>
+                    <h2 id="vg-playback-heading">Listening controls</h2>
                     <label class="vg-check"><input id="vg-enabled" type="checkbox"><span>Enable Volume Guard</span></label>
-                    <p class="vg-help">Turning this off makes the companion use unprocessed audio, including during scheduled hours.</p>
+                    <p class="vg-help">Use this master switch to turn Volume Guard on or off before you play a show or movie. It applies to all users. Restart playback to apply a change.</p>
+                    <label class="vg-check"><input id="vg-server" type="checkbox"><span>Process audio on the Jellyfin server</span></label>
+                    <p class="vg-help">Turn this on to use stock Moonfin without a companion app. It is off until you opt in. When enabled with an active listening mode, playback negotiation requests audio conversion instead of Direct Play; your user account must allow audio transcoding. Direct playback outside that negotiation path bypasses the effect.</p>
                     <div class="vg-fields">
-                        <div class="vg-field"><label for="vg-mode">Default player mode</label><select id="vg-mode" is="emby-select"><option>Off</option><option>Balanced</option><option>Night</option><option>Auto</option></select><p class="vg-help">Auto uses Night during scheduled hours and your daytime mode at other times. A player override takes precedence.</p></div>
+                        <div class="vg-field"><label for="vg-mode">Listening mode</label><select id="vg-mode" is="emby-select"><option>Off</option><option>Balanced</option><option>Night</option><option>Auto</option></select><p class="vg-help">Choose Off for normal audio, Balanced for everyday leveling, Night for quieter listening, or Auto to follow your schedule. The mode is chosen when a new audio conversion starts.</p></div>
                         <div class="vg-field"><label for="vg-daytime">Daytime mode</label><select id="vg-daytime" is="emby-select"><option>Off</option><option>Balanced</option><option>Night</option></select><p class="vg-help">Balanced levels quieter passages gently. Night uses a quieter target and a lower peak ceiling.</p></div>
                     </div>
                 </section>
@@ -50,7 +52,7 @@
                     <button id="vg-add" type="button" is="emby-button" class="raised">Add night window</button>
                 </section>
                 <details class="vg-section"><summary>Advanced audio profiles</summary>
-                    <p class="vg-help">These are signal levels, not a room volume limit or measured LUFS loudness. Higher maximum gain can raise background noise. Keep the target at or below the peak ceiling.</p>
+                    <p class="vg-help">These are signal levels, not a room volume limit or measured LUFS loudness. Server audio is encoded after processing, so the final decoded peak can differ from the filter ceiling. Higher maximum gain can raise background noise. Keep the target at or below the peak ceiling.</p>
                     <div id="vg-profiles"></div>
                 </details>
             </fieldset>
@@ -101,12 +103,12 @@
             return prefix + (status === 401 || status === 403 ? ' Sign in as a Jellyfin administrator.' : status === 400 ? ' The server rejected these values. Check the time zone, windows, and profile ranges.' : ' Check the server connection and try again.');
         }
         function render(config) {
-            $('enabled').checked = config.enabled; $('mode').value = config.defaultMode; $('daytime').value = config.daytimeMode; $('zone').value = config.timeZoneId; $('schedule').checked = config.scheduleEnabled;
+            $('enabled').checked = config.enabled; $('server').checked = config.serverProcessingEnabled === true; $('mode').value = config.defaultMode; $('daytime').value = config.daytimeMode; $('zone').value = config.timeZoneId; $('schedule').checked = config.scheduleEnabled;
             $('windows').replaceChildren(); config.nightWindows.forEach(addWindow); syncWindows();
             ['balanced', 'night'].forEach(function (key) { profileFields.forEach(function (field) { $(key + '-' + field[0]).value = config[key][field[0]]; }); });
         }
         function read() {
-            var config = { enabled: $('enabled').checked, defaultMode: $('mode').value, daytimeMode: $('daytime').value, timeZoneId: $('zone').value.trim(), scheduleEnabled: $('schedule').checked, nightWindows: [] };
+            var config = { enabled: $('enabled').checked, serverProcessingEnabled: $('server').checked, defaultMode: $('mode').value, daytimeMode: $('daytime').value, timeZoneId: $('zone').value.trim(), scheduleEnabled: $('schedule').checked, nightWindows: [] };
             if (!config.timeZoneId) throw new Error('Enter an IANA time zone.');
             Array.prototype.forEach.call($('windows').children, function (row) {
                 var days = Array.prototype.map.call(row.querySelectorAll('.vg-day:checked'), function (input) { return Number(input.value); });
@@ -133,7 +135,7 @@
             event.preventDefault(); if (busy || !loaded) return; error('');
             var config; try { config = read(); } catch (problem) { error(problem.message); return; }
             setBusy(true); message('Saving settings…');
-            try { await api('POST', config); dirty = false; $('dirty').hidden = true; message('Settings saved. The companion uses them when it next refreshes its policy.'); }
+            try { await api('POST', config); dirty = false; $('dirty').hidden = true; message('Settings saved. Start new playback to use the selected server audio mode.'); }
             catch (response) { message('Changes have not been saved. Your entries are still here.'); error(failure('Could not save settings.', response)); }
             finally { setBusy(false); }
         });

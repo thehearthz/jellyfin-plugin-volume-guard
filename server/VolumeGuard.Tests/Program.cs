@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Diagnostics;
 using Jellyfin.Plugin.VolumeGuard;
 
 var passed = 0;
@@ -64,4 +65,54 @@ Check(root.GetProperty("configuration").GetProperty("night").GetProperty("target
 Check(root.GetProperty("configuration").GetProperty("nightWindows")[0].GetProperty("days").GetArrayLength() == 7, "Contract weekday array");
 var roundTrip = JsonSerializer.Deserialize<PlaybackPolicy>(serialized)!;
 Check(roundTrip.Configuration.Night.AttackMs == 5 && roundTrip.ServerTimeUtc.Offset == TimeSpan.Zero, "JSON round trip");
-Console.WriteLine($"PASS: {passed} policy, validation, timezone, DST and JSON contract checks.");
+var server = new Configuration { ServerProcessingEnabled = true, DefaultMode = "Balanced" };
+var filter = ServerAudio.Filter(server, DateTimeOffset.UtcNow)!;
+Check(filter.Contains("level=0") && filter.Contains("link=maximum"), "Limiter makeup disabled and channels linked");
+Check(ServerAudio.Filter(new Configuration(), DateTimeOffset.UtcNow) is null, "Legacy configuration opts out of server DSP");
+server.Enabled = false;
+Check(ServerAudio.Filter(server, DateTimeOffset.UtcNow) is null, "Master disabled bypasses DSP");
+server.Enabled = true; server.DefaultMode = "Off";
+Check(ServerAudio.Filter(server, DateTimeOffset.UtcNow) is null, "Off mode bypasses DSP");
+server.DefaultMode = "Auto"; server.DaytimeMode = "Off";
+Check(ServerAudio.Filter(server, DateTimeOffset.Parse("2026-10-23T12:00:00Z")) is null, "Scheduled day off");
+Check(ServerAudio.Filter(server, DateTimeOffset.Parse("2026-10-23T23:00:00Z"))!.Contains("ratio=6"), "Scheduled night compression");
+var argsOriginal = "-i \"input with spaces.mkv\" -c:v copy -c:a aac -af \"aresample=48000,volume=2\" \"output with spaces.ts\"";
+var appended = ServerAudio.AppendFilter(argsOriginal, filter);
+Check(appended.Contains("aresample=48000,volume=2," + filter), "Retains resampling/downmix/base volume filters");
+Check(appended.Contains("-c:v copy") && appended.EndsWith("\"output with spaces.ts\""), "Video copy and output path retained");
+Check(ServerAudio.AppendFilter("-i input -c:a aac output.ts", filter).EndsWith("\" output.ts"), "Audio graph is an output option");
+Check(ServerAudio.AppendFilter("-i input -c:a aac -filter:a:0 volume=1 output.ts", filter).Contains("volume=1,"), "Alternate filter selector");
+try { ServerAudio.AppendFilter("-i in -c:a copy out", filter); throw new Exception("Accepted copied audio"); } catch (InvalidOperationException) { passed++; }
+try { ServerAudio.AppendFilter("-i in -af volume=1 -af volume=2 out", filter); throw new Exception("Accepted ambiguous graph"); } catch (InvalidOperationException) { passed++; }
+if (args.Length > 0)
+{
+    float[] Render(string source, string? graph)
+    {
+        var start = new ProcessStartInfo(args[0]) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+        foreach (var arg in new[] { "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", source, "-t", "12" }) start.ArgumentList.Add(arg);
+        if (graph is not null) { start.ArgumentList.Add("-af"); start.ArgumentList.Add(graph); }
+        foreach (var arg in new[] { "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1" }) start.ArgumentList.Add(arg);
+        using var process = Process.Start(start)!;
+        var errors = process.StandardError.ReadToEndAsync();
+        using var output = new MemoryStream();
+        process.StandardOutput.BaseStream.CopyTo(output);
+        process.WaitForExit();
+        if (process.ExitCode != 0) throw new Exception(errors.GetAwaiter().GetResult());
+        var bytes = output.ToArray(); var floats = new float[bytes.Length / 4]; Buffer.BlockCopy(bytes, 0, floats, 0, bytes.Length); return floats;
+    }
+    static double Rms(float[] samples) => Math.Sqrt(samples.Skip(48000 * 3).Take(48000 * 6).Average(sample => (double)sample * sample));
+    var quietRaw = Render("sine=frequency=440:sample_rate=48000,volume=0.08", null);
+    var quietLeveled = Render("sine=frequency=440:sample_rate=48000,volume=0.08", filter);
+    var gain = Rms(quietLeveled) / Rms(quietRaw);
+    Check(gain > 1.4 && gain < 2.05, "Real FFmpeg quiet audio gain respects profile cap");
+    var loud = Render("sine=frequency=440:sample_rate=48000,volume=8", filter);
+    var max = loud.Max(sample => Math.Abs(sample));
+    Check(max <= Math.Pow(10, -1.0 / 20) + 0.0001 && loud.All(float.IsFinite), "Real FFmpeg loud PCM respects peak ceiling");
+    var nightGraph = ServerAudio.Filter(new Configuration { ServerProcessingEnabled = true, DefaultMode = "Night" }, DateTimeOffset.UtcNow)!;
+    var nightLoud = Render("sine=frequency=440:sample_rate=48000,volume=8", nightGraph);
+    Check(Rms(nightLoud) < Rms(loud), "Real FFmpeg Night reduces loud material more strongly");
+    var silence = Render("anullsrc=r=48000:cl=stereo", filter);
+    Check(silence.All(sample => sample == 0), "Real FFmpeg silence stays silent across linked channels");
+    Console.WriteLine($"FFmpeg PCM evidence: quiet gain {20 * Math.Log10(gain):F2} dB; loud peak {20 * Math.Log10(max):F2} dBFS; Night RMS {20 * Math.Log10(Rms(nightLoud)):F2} dBFS.");
+}
+Console.WriteLine($"PASS: {passed} policy, validation, timezone, DST, DSP composition and JSON contract checks.");

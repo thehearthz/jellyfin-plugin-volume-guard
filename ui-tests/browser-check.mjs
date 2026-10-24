@@ -23,6 +23,8 @@ try {
   assert.equal(await page.eval(() => document.getElementById('vg-zone').value), config.timeZoneId);
   assert.equal(await page.eval(() => document.getElementById('vg-save').disabled), false);
   assert.equal(await page.eval(() => requests[0].dataType), 'json');
+  assert.equal(await page.eval(() => document.getElementById('vg-server').checked), false, 'server processing requires opt-in');
+  await page.eval(() => {document.getElementById('vg-server').checked=true;document.getElementById('vg-server').dispatchEvent(new Event('input',{bubbles:true}));});
   // Existing edits survive host navigation events and a cancelled reload.
   await page.eval(() => { const input = document.getElementById('vg-zone'); input.value = 'Europe/London'; input.dispatchEvent(new Event('input', {bubbles:true})); document.getElementById('volumeGuardPage').dispatchEvent(new Event('viewshow')); document.getElementById('vg-reload').click(); });
   assert.equal(await page.eval(() => document.getElementById('vg-zone').value), 'Europe/London');
@@ -31,6 +33,7 @@ try {
   await page.eval(() => { document.getElementById('vg-add').click(); document.querySelectorAll('.vg-window')[1].querySelector('button').click(); const days = document.querySelectorAll('.vg-window .vg-day'); days.forEach((day,i) => day.checked = i === 5); document.getElementById('vg-form').requestSubmit(); });
   assert.deepEqual(await page.eval(() => saved.nightWindows), [{days:[5],start:'22:00',end:'07:00'}]);
   assert.equal(await page.eval(() => saved.timeZoneId), 'Europe/London');
+  assert.equal(await page.eval(() => saved.serverProcessingEnabled), true, 'server processing toggle is saved');
   assert.equal(await page.eval(() => requests.at(-1).contentType), 'application/json');
   assert.equal(await page.eval(() => requests.at(-1).dataType || null), null, '204 save must not parse JSON');
   // Validation and errors never clear entries or mark unsuccessful writes saved.

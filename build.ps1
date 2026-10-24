@@ -1,5 +1,6 @@
-param([switch]$ServerOnly, [switch]$SkipTests)
+param([switch]$ServerOnly, [switch]$LegacyCompanion, [switch]$SkipTests, [string]$Version = '0.2.0.0')
 $ErrorActionPreference = 'Stop'
+if ($Version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw 'Version must have four numeric parts.' }
 Set-Location $PSScriptRoot
 $output = Join-Path $PSScriptRoot 'artifacts'
 New-Item -ItemType Directory -Force -Path $output | Out-Null
@@ -7,19 +8,23 @@ New-Item -ItemType Directory -Force -Path $output | Out-Null
 # Standard installations are supported; the task-local toolchain is an optional convenience.
 $localDotnet = Join-Path (Split-Path $PSScriptRoot -Parent) '.dotnet/dotnet.exe'
 $dotnetCommand = if (Test-Path -LiteralPath $localDotnet) { $localDotnet } else { 'dotnet' }
-& $dotnetCommand build server/VolumeGuard/VolumeGuard.csproj -c Release -p:NuGetAudit=false
+& $dotnetCommand build server/VolumeGuard/VolumeGuard.csproj -c Release -p:NuGetAudit=false "-p:Version=$Version"
 if ($LASTEXITCODE -ne 0) { throw 'Server build failed.' }
 if (!$SkipTests) {
-    & $dotnetCommand run --project server/VolumeGuard.Tests/VolumeGuard.Tests.csproj -c Release -p:NuGetAudit=false
+    & $dotnetCommand build server/VolumeGuard.Tests/VolumeGuard.Tests.csproj -c Release -p:NuGetAudit=false
+    if ($LASTEXITCODE -ne 0) { throw 'Server test build failed.' }
+    & $dotnetCommand server/VolumeGuard.Tests/bin/Release/net10.0/VolumeGuard.Tests.dll
     if ($LASTEXITCODE -ne 0) { throw 'Server tests failed.' }
-    & $dotnetCommand run --project server/VolumeGuard.HttpTests/VolumeGuard.HttpTests.csproj -c Release -p:NuGetAudit=false
+    & $dotnetCommand build server/VolumeGuard.HttpTests/VolumeGuard.HttpTests.csproj -c Release -p:NuGetAudit=false
+    if ($LASTEXITCODE -ne 0) { throw 'HTTP test build failed.' }
+    & $dotnetCommand server/VolumeGuard.HttpTests/bin/Release/net10.0/VolumeGuard.HttpTests.dll
     if ($LASTEXITCODE -ne 0) { throw 'HTTP tests failed.' }
 }
 $plugin = Join-Path $PSScriptRoot 'server/VolumeGuard/bin/Release/net10.0/Jellyfin.Plugin.VolumeGuard.dll'
 Copy-Item -LiteralPath $plugin -Destination $output -Force
-Compress-Archive -LiteralPath $plugin -DestinationPath (Join-Path $output 'volume-guard-server-0.1.0.0.zip') -Force
+Compress-Archive -LiteralPath $plugin -DestinationPath (Join-Path $output "volume-guard-server-$Version.zip") -Force
 
-if (!$ServerOnly) {
+if ($LegacyCompanion -and !$ServerOnly) {
     $localJava = Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot '.build-tools/microsoft-jdk') -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
     if (!$localJava) { $localJava = Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot '.build-tools/jdk') -Directory -ErrorAction SilentlyContinue | Select-Object -First 1 }
     if ($localJava) { $env:JAVA_HOME = $localJava.FullName }
