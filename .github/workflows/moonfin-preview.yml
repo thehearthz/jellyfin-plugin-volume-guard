@@ -1,0 +1,68 @@
+name: Build Moonfin Volume Guard preview
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  android-tv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MOONFIN_TEST_ID_SUFFIX: .volumeguard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Moonfin-Client/Moonfin-Core
+          ref: b86bbe6021eff5befdf311134bf3e831c032f21f
+          path: moonfin
+      - name: Apply Volume Guard integration
+        run: |
+          git -C moonfin apply --check "$GITHUB_WORKSPACE/integrations/moonfin-2.6.0/volume-guard.patch"
+          git -C moonfin apply "$GITHUB_WORKSPACE/integrations/moonfin-2.6.0/volume-guard.patch"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install pinned Flutter SDK
+        run: |
+          git clone --depth 1 --branch 3.47.2 https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/flutter/bin/flutter" --version
+      - name: Install Android native build components
+        run: sdkmanager 'ndk;28.2.13676358' 'cmake;3.22.1' 'platforms;android-36'
+      - name: Resolve pinned dependencies
+        working-directory: moonfin
+        run: flutter pub get
+      - name: Check Volume Guard policy
+        working-directory: moonfin
+        run: flutter test test/playback/volume_guard_controller_test.dart --reporter expanded --no-pub
+      - name: Check changed Dart modules
+        working-directory: moonfin
+        run: >-
+          dart analyze lib/playback/volume_guard_controller.dart
+          lib/playback/media3_player_backend.dart
+          lib/ui/widgets/playback/volume_guard_control.dart
+          lib/ui/screens/playback/video_player_screen.dart
+          lib/ui/screens/livetv/live_tv_player_screen.dart
+          packages/moonfin_native_video/lib/src/native_video_plugin.dart
+          --no-fatal-warnings
+      - name: Build Android TV preview
+        working-directory: moonfin
+        run: >-
+          flutter build apk --debug --flavor androidTv --no-pub
+          --dart-define=MOONFIN_FORCE_TV=true
+          --dart-define=DISTRIBUTION_CHANNEL=volume_guard_preview
+      - name: Run native audio regression tests
+        working-directory: moonfin/android
+        run: ./gradlew :moonfin_native_video:testDebugUnitTest --console=plain
+      - name: Package preview
+        run: |
+          mkdir -p dist
+          cp moonfin/build/app/outputs/flutter-apk/app-androidtv-debug.apk dist/moonfin-2.6.0-volume-guard-preview.1.apk
+          sha256sum dist/*.apk > dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moonfin-2.6.0-volume-guard-preview.1
+          path: dist/
+          compression-level: 0

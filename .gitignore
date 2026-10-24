@@ -9,3 +9,4 @@ artifacts/
 **/node_modules/
 ui-tests/screenshots/
 androidtv-source/.git
+moonfin-source/

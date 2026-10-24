@@ -1,0 +1,1782 @@
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index 7e31e1a..9f0dc39 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -120,7 +120,7 @@ android {
+             versionName = androidTvVersionName
+             ndk { abiFilters += tvAbis }
+             manifestPlaceholders["appName"] =
+-                if (testIdSuffix.isEmpty()) baseAppName else "$baseAppName Test"
++                if (testIdSuffix == ".volumeguard") "Moonfin + Volume Guard" else if (testIdSuffix.isEmpty()) baseAppName else "$baseAppName Test"
+             // Impeller off on TV: the GLES fallback stutters on TV-box GPUs.
+             manifestPlaceholders["enableImpeller"] = "false"
+         }
+diff --git a/lib/playback/media3_player_backend.dart b/lib/playback/media3_player_backend.dart
+index 639f00e..0dd342d 100644
+--- a/lib/playback/media3_player_backend.dart
++++ b/lib/playback/media3_player_backend.dart
+@@ -168,6 +168,15 @@ class Media3PlayerBackend extends PlayerBackend {
+ 
+   int get volumeBoostLevel => _volumeBoostLevel;
+ 
++  Map<String, dynamic>? _volumeGuardProfile;
++
++  /// Retain settings through native player recreation and Live TV retunes.
++  Future<void> setVolumeGuard(Map<String, dynamic> profile) async {
++    if (_disposed) return;
++    _volumeGuardProfile = Map<String, dynamic>.from(profile);
++    await _invoke<void>('setVolumeGuard', _volumeGuardProfile);
++  }
++
+   @override
+   Stream<Map<String, dynamic>> get errorStream => _errorStream.stream;
+ 
+@@ -175,7 +184,8 @@ class Media3PlayerBackend extends PlayerBackend {
+   double get subtitleAutoOffsetSeconds => _subtitleAutoOffsetSeconds;
+ 
+   @override
+-  Stream<double> get subtitleAutoOffsetStream => _subtitleAutoOffsetStream.stream;
++  Stream<double> get subtitleAutoOffsetStream =>
++      _subtitleAutoOffsetStream.stream;
+ 
+   Future<T?> _invoke<T>(String method, [dynamic arguments]) async {
+     if (_disposed) return null;
+@@ -473,8 +483,9 @@ class Media3PlayerBackend extends PlayerBackend {
+           '@${applied.toStringAsFixed(3)} for $content '
+           '($behavior, mode ${_toInt(map['appliedDisplayModeId'])})';
+     } else {
+-      final modes = (map['supportedModes'] as List<dynamic>? ?? const [])
+-          .join(', ');
++      final modes = (map['supportedModes'] as List<dynamic>? ?? const []).join(
++        ', ',
++      );
+       line =
+           'Media3: no display mode fits $content ($behavior'
+           '${modes.isEmpty ? '' : ', display offers $modes'})';
+@@ -1034,6 +1045,9 @@ class Media3PlayerBackend extends PlayerBackend {
+     _lastFrameRateLine = null;
+     _sourceIsLive = payload['isLive'] == true;
+     _setSubtitleAutoOffset(0);
++    if (_volumeGuardProfile != null) {
++      await _invoke<void>('setVolumeGuard', _volumeGuardProfile);
++    }
+     await _invoke<void>('setSource', {
+       'url': url,
+       'headers': headers,
+@@ -1115,6 +1129,9 @@ class Media3PlayerBackend extends PlayerBackend {
+ 
+   Future<void> appResumed() async {
+     await _invoke<void>('appResumed');
++    if (_volumeGuardProfile != null) {
++      await _invoke<void>('setVolumeGuard', _volumeGuardProfile);
++    }
+   }
+ 
+   Future<void> _teardown(String command) async {
+diff --git a/lib/playback/volume_guard_controller.dart b/lib/playback/volume_guard_controller.dart
+new file mode 100644
+index 0000000..78eae06
+--- /dev/null
++++ b/lib/playback/volume_guard_controller.dart
+@@ -0,0 +1,334 @@
++import 'dart:async';
++import 'dart:convert';
++
++import 'package:crypto/crypto.dart';
++import 'package:dio/dio.dart';
++import 'package:flutter/foundation.dart';
++import 'package:server_core/server_core.dart';
++import 'package:shared_preferences/shared_preferences.dart';
++import 'package:timezone/data/latest.dart' as tzdata;
++import 'package:timezone/timezone.dart' as tz;
++
++enum VolumeGuardMode { off, balanced, night, auto }
++
++/// Device-side policy. The server supplies settings; decoded PCM is processed
++/// on this player, including Direct Play and Live TV.
++class VolumeGuardController extends ChangeNotifier {
++  VolumeGuardController({
++    required String serverUrl,
++    required String accessToken,
++    required String userId,
++    required String deviceId,
++    required Future<void> Function(Map<String, dynamic>) applyProfile,
++    Dio? dio,
++    DateTime Function()? now,
++  }) : _serverUrl = serverUrl.replaceAll(RegExp(r'/+$'), ''),
++       // Keep named constructor arguments public while credentials stay private.
++       // ignore: prefer_initializing_formals
++       _accessToken = accessToken,
++       _scope = sha256
++           .convert(
++             utf8.encode(
++               jsonEncode([
++                 serverUrl.replaceAll(RegExp(r'/+$'), ''),
++                 userId,
++                 deviceId,
++               ]),
++             ),
++           )
++           .toString(),
++       // ignore: prefer_initializing_formals
++       _applyProfile = applyProfile,
++       _dio =
++           dio ??
++           Dio(
++             BaseOptions(
++               connectTimeout: const Duration(seconds: 5),
++               receiveTimeout: const Duration(seconds: 8),
++             ),
++           ),
++       _ownsDio = dio == null,
++       _now = now ?? DateTime.now {
++    if (_ownsDio) configureServerDio(_dio);
++  }
++
++  final String _serverUrl;
++  final String _accessToken;
++  final String _scope;
++  final Dio _dio;
++  final bool _ownsDio;
++  final DateTime Function() _now;
++  final Future<void> Function(Map<String, dynamic>) _applyProfile;
++  SharedPreferences? _preferences;
++  Map<String, dynamic>? _policy;
++  Timer? _refreshTimer;
++  Timer? _scheduleTimer;
++  bool _disposed = false;
++  bool _started = false;
++  bool _fetching = false;
++  bool _serverReachable = false;
++  bool _hasSavedMode = false;
++  VolumeGuardMode _mode = VolumeGuardMode.auto;
++  VolumeGuardMode _effectiveMode = VolumeGuardMode.off;
++  Map<String, dynamic>? _lastProfile;
++  Future<void> _pendingApply = Future<void>.value();
++
++  VolumeGuardMode get mode => _mode;
++  VolumeGuardMode get effectiveMode => _effectiveMode;
++  bool get usingServerPolicy => _policy != null;
++  String get statusLabel =>
++      '${_effectiveMode.name} · ${_policy == null
++          ? 'local schedule'
++          : _serverReachable
++          ? 'server schedule'
++          : 'cached server schedule'}';
++  String get _modeKey => 'volumeGuard.mode.$_scope';
++  String get _policyKey => 'volumeGuard.policy.$_scope';
++
++  Future<void> start() async {
++    if (_started || _disposed) return;
++    _started = true;
++    tzdata.initializeTimeZones();
++    _preferences = await SharedPreferences.getInstance();
++    if (_disposed) return;
++    final savedMode = _preferences!.getString(_modeKey);
++    _hasSavedMode = savedMode != null;
++    final cached = _preferences!.getString(_policyKey);
++    if (cached != null) {
++      try {
++        _policy = _validatedPolicy(jsonDecode(cached));
++      } catch (_) {}
++    }
++    _mode = _parseMode(
++      savedMode ?? _policy?['defaultMode'],
++      VolumeGuardMode.auto,
++    );
++    await _evaluate();
++    if (_disposed) return;
++    _scheduleTimer = Timer.periodic(const Duration(seconds: 15), (_) {
++      unawaited(_evaluate());
++    });
++    _refreshTimer = Timer.periodic(const Duration(seconds: 60), (_) {
++      unawaited(refreshPolicy());
++    });
++    await refreshPolicy();
++  }
++
++  Future<void> setMode(VolumeGuardMode mode) async {
++    if (_disposed) return;
++    _hasSavedMode = true;
++    _mode = mode;
++    await _evaluate();
++    await _preferences?.setString(_modeKey, mode.name);
++  }
++
++  /// Keep the base path of reverse-proxy installations such as /jellyfin.
++  @visibleForTesting
++  static Uri policyUri(String baseUrl) {
++    final base = Uri.parse(baseUrl);
++    return Uri(
++      scheme: base.scheme,
++      host: base.host,
++      port: base.hasPort ? base.port : null,
++      path: '${base.path.replaceAll(RegExp(r'/+$'), '')}/VolumeGuard/policy',
++    );
++  }
++
++  Future<void> refreshPolicy() async {
++    if (_disposed || _fetching || _accessToken.isEmpty) return;
++    _fetching = true;
++    try {
++      final response = await _dio.getUri<dynamic>(
++        policyUri(_serverUrl),
++        options: Options(
++          headers: {'X-Emby-Token': _accessToken},
++          followRedirects: false,
++          responseType: ResponseType.json,
++        ),
++      );
++      final policy = _validatedPolicy(response.data);
++      if (_disposed) return;
++      _policy = policy;
++      if (!_hasSavedMode) {
++        _mode = _parseMode(policy['defaultMode'], VolumeGuardMode.auto);
++      }
++      _serverReachable = true;
++      await _preferences?.setString(_policyKey, jsonEncode(policy));
++    } catch (_) {
++      // The plugin is optional. Keep its last valid policy through outages;
++      // never log a response or URL that might contain session credentials.
++      _serverReachable = false;
++    } finally {
++      _fetching = false;
++      if (!_disposed) await _evaluate();
++    }
++  }
++
++  static VolumeGuardMode _parseMode(dynamic value, VolumeGuardMode fallback) {
++    for (final mode in VolumeGuardMode.values) {
++      if (mode.name == value?.toString().toLowerCase()) return mode;
++    }
++    return fallback;
++  }
++
++  static Map<String, dynamic> _validatedPolicy(dynamic value) {
++    if (value is! Map ||
++        value['schemaVersion'] != 1 ||
++        value['enabled'] is! bool ||
++        value['configuration'] is! Map) {
++      throw const FormatException('Unsupported Volume Guard policy');
++    }
++    final policy = Map<String, dynamic>.from(value);
++    final config = Map<String, dynamic>.from(value['configuration'] as Map);
++    _profile(config['balanced'], true);
++    _profile(config['night'], true);
++    if (config['timeZoneId'] is! String ||
++        config['scheduleEnabled'] is! bool ||
++        config['nightWindows'] is! List) {
++      throw const FormatException('Invalid Volume Guard schedule');
++    }
++    for (final window in config['nightWindows'] as List) {
++      if (window is! Map ||
++          window['days'] is! List ||
++          (window['days'] as List).any((d) => d is! int || d < 0 || d > 6) ||
++          _minutes(window['start']) == null ||
++          _minutes(window['end']) == null) {
++        throw const FormatException('Invalid Volume Guard window');
++      }
++    }
++    return policy;
++  }
++
++  static Map<String, dynamic> _profile(dynamic source, bool enabled) {
++    if (source is! Map) throw const FormatException('Invalid audio profile');
++    double read(String key, double min, double max) {
++      final value = source[key];
++      if (value is! num || !value.isFinite || value < min || value > max) {
++        throw const FormatException('Invalid audio profile value');
++      }
++      return value.toDouble();
++    }
++
++    final target = read('targetRmsDb', -40, -6);
++    final ceiling = read('limiterCeilingDb', -20, 0);
++    if (target > ceiling) {
++      throw const FormatException('Invalid audio target');
++    }
++    return {
++      'enabled': enabled,
++      'targetDb': target,
++      'maxGainDb': read('maxGainDb', 0, 24),
++      'ceilingDb': ceiling,
++      'attackMs': read('attackMs', 1, 200),
++      'releaseMs': read('releaseMs', 20, 5000),
++    };
++  }
++
++  static int? _minutes(dynamic value) {
++    if (value is! String || !RegExp(r'^\d{2}:\d{2}$').hasMatch(value)) {
++      return null;
++    }
++    final parts = value.split(':').map(int.parse).toList();
++    if (parts[0] > 23 || parts[1] > 59) return null;
++    return parts[0] * 60 + parts[1];
++  }
++
++  /// Evaluate wall-clock membership from an instant. Both occurrences of the
++  /// repeated autumn hour match; spring-forward gaps never occur. Overnight
++  /// windows belong to their start day; end is exclusive.
++  @visibleForTesting
++  static bool scheduleActive(Map<String, dynamic> config, DateTime instant) {
++    if (config['scheduleEnabled'] != true) return false;
++    final zone = config['timeZoneId'] as String;
++    final local = tz.TZDateTime.from(
++      instant,
++      zone == 'UTC' ? tz.UTC : tz.getLocation(zone),
++    );
++    return _windowsActive(config['nightWindows'] as List, local);
++  }
++
++  static bool _windowsActive(List windows, DateTime local) {
++    final day = local.weekday % 7;
++    final minute = local.hour * 60 + local.minute;
++    return windows.any((dynamic window) {
++      final start = _minutes(window['start'])!;
++      final end = _minutes(window['end'])!;
++      final days = window['days'] as List;
++      return start < end
++          ? days.contains(day) && minute >= start && minute < end
++          : start > end &&
++                ((days.contains(day) && minute >= start) ||
++                    (days.contains((day + 6) % 7) && minute < end));
++    });
++  }
++
++  Future<void> _evaluate() async {
++    if (_disposed) return;
++    final config = _policy?['configuration'] as Map?;
++    var effective = _mode;
++    if (_policy?['enabled'] == false || config?['enabled'] == false) {
++      effective = VolumeGuardMode.off;
++    } else if (effective == VolumeGuardMode.auto) {
++      if (config == null) {
++        final local = _now().toLocal();
++        effective = local.hour >= 22 || local.hour < 7
++            ? VolumeGuardMode.night
++            : VolumeGuardMode.balanced;
++      } else {
++        try {
++          effective = scheduleActive(Map<String, dynamic>.from(config), _now())
++              ? VolumeGuardMode.night
++              : _parseMode(config['daytimeMode'], VolumeGuardMode.balanced);
++        } catch (_) {
++          // Windows-only/custom timezone IDs may not exist in the IANA data.
++          // Preserve the server's evaluated result instead of using UTC.
++          effective = _parseMode(
++            _policy!['effectiveAutoMode'],
++            VolumeGuardMode.balanced,
++          );
++        }
++        if (effective == VolumeGuardMode.auto) {
++          effective = VolumeGuardMode.balanced;
++        }
++      }
++    }
++    _effectiveMode = effective;
++    final night = effective == VolumeGuardMode.night;
++    final profile = config == null
++        ? <String, dynamic>{
++            'enabled': effective != VolumeGuardMode.off,
++            'targetDb': night ? -26.0 : -20.0,
++            'maxGainDb': night ? 9.0 : 6.0,
++            'ceilingDb': night ? -4.0 : -1.0,
++            'attackMs': night ? 5.0 : 10.0,
++            'releaseMs': night ? 800.0 : 500.0,
++          }
++        : _profile(
++            config[night ? 'night' : 'balanced'],
++            effective != VolumeGuardMode.off,
++          );
++    if (!mapEquals(profile, _lastProfile)) {
++      _lastProfile = profile;
++      _pendingApply = _pendingApply
++          .then((_) async {
++            if (!_disposed) await _applyProfile(profile);
++          })
++          .catchError((Object _) {
++            // Retry on the next schedule evaluation after a native view transition.
++            _lastProfile = null;
++          });
++    }
++    notifyListeners();
++    await _pendingApply;
++  }
++
++  @override
++  void dispose() {
++    if (_disposed) return;
++    _disposed = true;
++    _refreshTimer?.cancel();
++    _scheduleTimer?.cancel();
++    if (_ownsDio) _dio.close(force: true);
++    super.dispose();
++  }
++}
+diff --git a/lib/ui/screens/livetv/live_tv_player_screen.dart b/lib/ui/screens/livetv/live_tv_player_screen.dart
+index 38688ba..45c5445 100644
+--- a/lib/ui/screens/livetv/live_tv_player_screen.dart
++++ b/lib/ui/screens/livetv/live_tv_player_screen.dart
+@@ -21,6 +21,8 @@ import '../../../playback/html_video_backend.dart';
+ import '../../../playback/media_kit_player_backend.dart';
+ import '../../../platform/pip_service.dart';
+ import '../../../playback/media3_player_backend.dart';
++import '../../../playback/volume_guard_controller.dart';
++import '../../widgets/playback/volume_guard_control.dart';
+ import '../../../preference/preference_constants.dart';
+ import '../../../preference/user_preferences.dart';
+ import '../../../util/clock_format.dart';
+@@ -78,6 +80,80 @@ class _LiveTvPlayerScreenState extends State<LiveTvPlayerScreen>
+     return backend is MediaKitPlayerBackend ? backend : null;
+   }
+ 
++  VolumeGuardController? _volumeGuard;
++  Media3PlayerBackend? _volumeGuardBackend;
++  String? _volumeGuardScope;
++
++  void _onVolumeGuardChanged() {
++    if (mounted) setState(() {});
++  }
++
++  void _detachVolumeGuard() {
++    _volumeGuard?.removeListener(_onVolumeGuardChanged);
++    _volumeGuard?.dispose();
++    _volumeGuard = null;
++    final backend = _volumeGuardBackend;
++    _volumeGuardBackend = null;
++    _volumeGuardScope = null;
++    if (backend != null) {
++      unawaited(backend.setVolumeGuard({'enabled': false}));
++    }
++  }
++
++  void _syncVolumeGuard() {
++    final backend = _activeMedia3Backend;
++    final client = _client;
++    final scope = '${client.baseUrl}|${client.userId}|${client.deviceInfo.id}';
++    if (!PlatformDetection.isAndroid ||
++        !PlatformDetection.isTV ||
++        backend == null ||
++        client.serverType != ServerType.jellyfin ||
++        (client.accessToken?.isEmpty ?? true) ||
++        (client.userId?.isEmpty ?? true)) {
++      _detachVolumeGuard();
++      return;
++    }
++    if (identical(backend, _volumeGuardBackend) && scope == _volumeGuardScope) {
++      return;
++    }
++    _detachVolumeGuard();
++    late final VolumeGuardController controller;
++    controller = VolumeGuardController(
++      serverUrl: client.baseUrl,
++      accessToken: client.accessToken!,
++      userId: client.userId!,
++      deviceId: client.deviceInfo.id,
++      applyProfile: (profile) async {
++        if (mounted &&
++            identical(_volumeGuard, controller) &&
++            identical(_manager.backend, backend)) {
++          await backend.setVolumeGuard(profile);
++        }
++      },
++    );
++    _volumeGuardBackend = backend;
++    _volumeGuardScope = scope;
++    _volumeGuard = controller;
++    controller.addListener(_onVolumeGuardChanged);
++    unawaited(controller.start());
++  }
++
++  void _showVolumeGuard() {
++    final controller = _volumeGuard;
++    if (controller == null) return;
++    _hideTimer?.cancel();
++    unawaited(() async {
++      await showVolumeGuardControl(
++        context,
++        controller,
++        isCurrent: () => identical(_volumeGuard, controller),
++      );
++      if (!mounted) return;
++      _suppressBackNavigation();
++      _scheduleHide();
++    }());
++  }
++
+   Media3PlayerBackend? get _activeMedia3Backend {
+     final backend = _manager.backend;
+     return backend is Media3PlayerBackend ? backend : null;
+@@ -156,6 +232,7 @@ class _LiveTvPlayerScreenState extends State<LiveTvPlayerScreen>
+   final _tvGuideFocus = FocusNode(debugLabel: 'LiveTvGuide');
+   final _tvAudioFocus = FocusNode(debugLabel: 'LiveTvAudio');
+   final _tvSubtitleFocus = FocusNode(debugLabel: 'LiveTvSubtitle');
++  final _tvVolumeGuardFocus = FocusNode(debugLabel: 'LiveTvVolumeGuard');
+   final _tvBitrateFocus = FocusNode(debugLabel: 'LiveTvBitrate');
+   final _tvPlaybackInfoFocus = FocusNode(debugLabel: 'LiveTvPlaybackInfo');
+   // Index of the currently focused OSD control within _osdFocusOrder. Tracked
+@@ -175,7 +252,9 @@ class _LiveTvPlayerScreenState extends State<LiveTvPlayerScreen>
+     _applyPlayerDisplayMode();
+     _applySubtitleStyle();
+     _prefs.addListener(_applySubtitleStyle);
++    _syncVolumeGuard();
+     _backendSub = _manager.backendChangedStream.listen((backend) {
++      _syncVolumeGuard();
+       if (!mounted) return;
+       _applySubtitleStyle(force: true);
+       _listenForPlayerTrackChanges();
+@@ -187,6 +266,7 @@ class _LiveTvPlayerScreenState extends State<LiveTvPlayerScreen>
+     _tvChannelsFocus.addListener(_onControlFocusChanged);
+     _tvGuideFocus.addListener(_onControlFocusChanged);
+     _tvAudioFocus.addListener(_onControlFocusChanged);
++    _tvVolumeGuardFocus.addListener(_onControlFocusChanged);
+     _tvSubtitleFocus.addListener(_onControlFocusChanged);
+     _tvBitrateFocus.addListener(_onControlFocusChanged);
+     _tvPlaybackInfoFocus.addListener(_onControlFocusChanged);
+@@ -212,6 +292,7 @@ class _LiveTvPlayerScreenState extends State<LiveTvPlayerScreen>
+ 
+   @override
+   void dispose() {
++    _detachVolumeGuard();
+     _screensaverPlayingSub?.cancel();
+     _screensaverController.setPlaybackActive(false);
+     _carouselPrewarm?.dispose();
+@@ -250,6 +331,7 @@ class _LiveTvPlayerScreenState extends State<LiveTvPlayerScreen>
+     _tvChannelsFocus.removeListener(_onControlFocusChanged);
+     _tvGuideFocus.removeListener(_onControlFocusChanged);
+     _tvAudioFocus.removeListener(_onControlFocusChanged);
++    _tvVolumeGuardFocus.removeListener(_onControlFocusChanged);
+     _tvSubtitleFocus.removeListener(_onControlFocusChanged);
+     _tvBitrateFocus.removeListener(_onControlFocusChanged);
+     _tvPlaybackInfoFocus.removeListener(_onControlFocusChanged);
+@@ -258,6 +340,7 @@ class _LiveTvPlayerScreenState extends State<LiveTvPlayerScreen>
+     _tvChannelsFocus.dispose();
+     _tvGuideFocus.dispose();
+     _tvAudioFocus.dispose();
++    _tvVolumeGuardFocus.dispose();
+     _tvSubtitleFocus.dispose();
+     _tvBitrateFocus.dispose();
+     _tvPlaybackInfoFocus.dispose();
+@@ -857,6 +940,7 @@ class _LiveTvPlayerScreenState extends State<LiveTvPlayerScreen>
+     _tvChannelsFocus,
+     _tvGuideFocus,
+     if (_streamsOfType('Audio').length > 1) _tvAudioFocus,
++    if (_volumeGuard != null) _tvVolumeGuardFocus,
+     if (_hasSubtitleChoices) _tvSubtitleFocus,
+     _tvBitrateFocus,
+     _tvPlaybackInfoFocus,
+@@ -2073,6 +2157,17 @@ class _LiveTvPlayerScreenState extends State<LiveTvPlayerScreen>
+               onPressed: _showAudioSelector,
+             ),
+           ],
++          if (_volumeGuard != null) ...[
++            const SizedBox(width: AppSpacing.spaceSm),
++            _buildOverlayControlButton(
++              focusNode: _tvVolumeGuardFocus,
++              icon: Icons.graphic_eq_rounded,
++              tooltip:
++                  'Volume Guard: ${volumeGuardModeLabel(_volumeGuard!.mode)} '
++                  '(${_volumeGuard!.statusLabel})',
++              onPressed: _showVolumeGuard,
++            ),
++          ],
+           if (hasSubtitles) ...[
+             const SizedBox(width: AppSpacing.spaceSm),
+             _buildOverlayControlButton(
+diff --git a/lib/ui/screens/playback/video_player_screen.dart b/lib/ui/screens/playback/video_player_screen.dart
+index 5cf251a..e06b780 100644
+--- a/lib/ui/screens/playback/video_player_screen.dart
++++ b/lib/ui/screens/playback/video_player_screen.dart
+@@ -92,6 +92,8 @@ import '../../../util/remote_subtitle_labels.dart';
+ import '../../../util/subtitle_appearance_schedule.dart';
+ import '../../../playback/delay_limits.dart';
+ import '../../../playback/media3_player_backend.dart';
++import '../../../playback/volume_guard_controller.dart';
++import '../../widgets/playback/volume_guard_control.dart';
+ import '../../../util/system_ui.dart';
+ import 'playback_takeover.dart';
+ import 'osd_buttons.dart';
+@@ -167,6 +169,80 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+         : null;
+   }
+ 
++  VolumeGuardController? _volumeGuard;
++  Media3PlayerBackend? _volumeGuardBackend;
++  String? _volumeGuardScope;
++
++  void _onVolumeGuardChanged() {
++    if (mounted) setState(() {});
++  }
++
++  void _detachVolumeGuard() {
++    _volumeGuard?.removeListener(_onVolumeGuardChanged);
++    _volumeGuard?.dispose();
++    _volumeGuard = null;
++    final backend = _volumeGuardBackend;
++    _volumeGuardBackend = null;
++    _volumeGuardScope = null;
++    if (backend != null) {
++      unawaited(backend.setVolumeGuard({'enabled': false}));
++    }
++  }
++
++  void _syncVolumeGuard() {
++    final backend = _activeMedia3Backend;
++    final client = _clientForQueueItem(_queue.currentItem);
++    final scope = '${client.baseUrl}|${client.userId}|${client.deviceInfo.id}';
++    if (!PlatformDetection.isAndroid ||
++        !PlatformDetection.isTV ||
++        backend == null ||
++        client.serverType != ServerType.jellyfin ||
++        (client.accessToken?.isEmpty ?? true) ||
++        (client.userId?.isEmpty ?? true)) {
++      _detachVolumeGuard();
++      return;
++    }
++    if (identical(backend, _volumeGuardBackend) && scope == _volumeGuardScope) {
++      return;
++    }
++    _detachVolumeGuard();
++    late final VolumeGuardController controller;
++    controller = VolumeGuardController(
++      serverUrl: client.baseUrl,
++      accessToken: client.accessToken!,
++      userId: client.userId!,
++      deviceId: client.deviceInfo.id,
++      applyProfile: (profile) async {
++        if (mounted &&
++            identical(_volumeGuard, controller) &&
++            identical(_manager.backend, backend)) {
++          await backend.setVolumeGuard(profile);
++        }
++      },
++    );
++    _volumeGuardBackend = backend;
++    _volumeGuardScope = scope;
++    _volumeGuard = controller;
++    controller.addListener(_onVolumeGuardChanged);
++    unawaited(controller.start());
++  }
++
++  void _showVolumeGuard() {
++    final controller = _volumeGuard;
++    if (controller == null) return;
++    _hideTimer?.cancel();
++    unawaited(() async {
++      await showVolumeGuardControl(
++        context,
++        controller,
++        isCurrent: () => identical(_volumeGuard, controller),
++      );
++      if (!mounted) return;
++      _suppressBackNavigation();
++      _showControls();
++    }());
++  }
++
+   Media3PlayerBackend? get _activeMedia3Backend {
+     final backend = _activeBackend;
+     return backend is Media3PlayerBackend ? backend : null;
+@@ -883,7 +959,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+       if (!mounted || _isStopping) return;
+       unawaited(_exitPlayback());
+     });
++    _syncVolumeGuard();
+     _backendSub = _manager.backendChangedStream.listen((backend) {
++      _syncVolumeGuard();
+       if (backend is Media3PlayerBackend) {
+         unawaited(_syncMedia3ZoomMode());
+         _syncMedia3VolumeBoostLevel();
+@@ -936,6 +1014,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+       }
+     }
+     _queueSub = _queue.queueChangedStream.listen((_) {
++      _syncVolumeGuard();
+       _loadSegmentsForCurrentItem();
+       _manager.suppressAutoNext = false;
+       _consecutiveEpisodes++;
+@@ -1016,6 +1095,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+ 
+   @override
+   void dispose() {
++    _detachVolumeGuard();
+     _trickplayLoadGeneration++;
+     _hdrStatus?.removeListener(_onHdrStatusChanged);
+     _hdrRendererCycling?.removeListener(_onHdrStatusChanged);
+@@ -1194,9 +1274,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+     }
+     _lastCastErrorAt = now;
+     _lastCastErrorMessage = message;
+-    ScaffoldMessenger.of(
+-      context,
+-    ).showSnackBar(SnackBar(content: Text(message)));
++    ScaffoldMessenger.of(context)
++        .showSnackBar(SnackBar(content: Text(message)));
+   }
+ 
+   void _showThrottledPlaybackError(String message) {
+@@ -1216,9 +1295,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+ 
+     _lastPlaybackErrorAt = now;
+     _lastPlaybackErrorMessage = normalized;
+-    ScaffoldMessenger.of(
+-      context,
+-    ).showSnackBar(SnackBar(content: Text(normalized)));
++    ScaffoldMessenger.of(context)
++        .showSnackBar(SnackBar(content: Text(normalized)));
+   }
+ 
+   void _showBringupFailureIfAny(PlaybackBringupState state) {
+@@ -4096,13 +4174,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+                               _nextUpItem!.primaryImageTag != null &&
+                                   _prefs.get(UserPreferences.nextUpBehavior) !=
+                                       NextUpBehavior.minimal
+-                              ? _clientForItem(
+-                                  _nextUpItem!,
+-                                ).imageApi.getPrimaryImageUrl(
+-                                  _nextUpItem!.id,
+-                                  maxWidth: 400,
+-                                  tag: _nextUpItem!.primaryImageTag,
+-                                )
++                              ? _clientForItem(_nextUpItem!).imageApi
++                                    .getPrimaryImageUrl(
++                                      _nextUpItem!.id,
++                                      maxWidth: 400,
++                                      tag: _nextUpItem!.primaryImageTag,
++                                    )
+                               : null,
+                           timeoutMs: _prefs.get(UserPreferences.nextUpTimeout),
+                           onPlayNext: _handleNextUpPlay,
+@@ -4394,9 +4471,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+                   alignment: pos.alignment,
+                   child: Padding(
+                     padding: pos.safePadding,
+-                    child: PlayerLoadingOverlay(
+-                      label: _streamLoadingLabel,
+-                    ),
++                    child: PlayerLoadingOverlay(label: _streamLoadingLabel),
+                   ),
+                 ),
+         );
+@@ -4781,11 +4856,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+       return null;
+     }
+ 
+-    return _clientForQueueItem(item).imageApi.getLogoImageUrl(
+-      normalizedItemId,
+-      maxWidth: 420,
+-      tag: normalizedTag,
+-    );
++    return _clientForQueueItem(item).imageApi
++        .getLogoImageUrl(normalizedItemId, maxWidth: 420, tag: normalizedTag);
+   }
+ 
+   String? _artworkUrlForQueueItem(dynamic item) {
+@@ -5125,7 +5197,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+     );
+   }
+ 
+-
+   /// The seek bar slider itself, lifted out so the marker layer can stack
+   /// over it without pushing the whole tree past the line limit.
+   Widget _buildSeekSlider({
+@@ -5137,38 +5208,25 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+       data: SliderThemeData(
+         trackHeight: 4,
+         thumbShape: const RoundSliderThumbShape(
+-          enabledThumbRadius:
+-              TrickplayPreviewLayout.seekThumbRadius,
++          enabledThumbRadius: TrickplayPreviewLayout.seekThumbRadius,
+         ),
+-        overlayShape: const RoundSliderOverlayShape(
+-          overlayRadius: 14,
++        overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
++        activeTrackColor: AppColorScheme.rangeProgress,
++        secondaryActiveTrackColor: AppColorScheme.rangeTrack.withValues(
++          alpha: 0.8,
+         ),
+-        activeTrackColor:
+-            AppColorScheme.rangeProgress,
+-        secondaryActiveTrackColor: AppColorScheme
+-            .rangeTrack
+-            .withValues(alpha: 0.8),
+         inactiveTrackColor: AppColorScheme.rangeTrack,
+-        thumbColor:
+-            (PlatformDetection.isTV &&
+-                _seekbarFocused)
++        thumbColor: (PlatformDetection.isTV && _seekbarFocused)
+             ? Colors.white
+             : AppColorScheme.rangeThumb,
+-        overlayColor: AppColorScheme.rangeThumb
+-            .withValues(alpha: 0.2),
++        overlayColor: AppColorScheme.rangeThumb.withValues(alpha: 0.2),
+       ),
+       child: Slider(
+         value: positionMs.clamp(0.0, durationMs),
+-        secondaryTrackValue: bufferMs.clamp(
+-          0.0,
+-          durationMs,
+-        ),
++        secondaryTrackValue: bufferMs.clamp(0.0, durationMs),
+         max: durationMs,
+         onChangeStart: (v) {
+-          _suppressSeekPrompts(
+-            duration:
+-                _seekDragPromptSuppressionDuration,
+-          );
++          _suppressSeekPrompts(duration: _seekDragPromptSuppressionDuration);
+           _pendingScrubSeekTarget = null;
+           _beginScrub();
+           setState(() {
+@@ -5179,14 +5237,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+         },
+         onChanged: (v) {
+           _suppressSeekPrompts(
+-            duration:
+-                _seekDragPromptSuppressionDuration,
++            duration: _seekDragPromptSuppressionDuration,
+             dismissVisiblePrompts: false,
+           );
+           setState(() => _seekValue = v);
+-          _prefetchVisibleTrickplayPreview(
+-            Duration(milliseconds: v.round()),
+-          );
++          _prefetchVisibleTrickplayPreview(Duration(milliseconds: v.round()));
+         },
+         onChangeEnd: (v) {
+           _suppressSeekPrompts();
+@@ -5813,6 +5868,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+         };
+ 
+         final secondaryButtons = _wireTvSecondaryEnds([
++          if (_volumeGuard != null)
++            _controlButton(
++              Icons.graphic_eq_rounded,
++              onPressed: _showVolumeGuard,
++              size: secondaryIconSize,
++              extent: secondaryExtent,
++              tooltip:
++                  'Volume Guard: ${volumeGuardModeLabel(_volumeGuard!.mode)} '
++                  '(${_volumeGuard!.statusLabel})',
++            ),
+           for (final button in osdButtonLayout.ordered(
+             OsdButton.values,
+             (button) => button.id,
+@@ -7169,8 +7234,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+                 autoOffset: audio
+                     ? 0.0
+                     : (_activeBackend?.subtitleAutoOffsetSeconds ?? 0.0),
+-                autoOffsetStream:
+-                    audio ? null : _activeBackend?.subtitleAutoOffsetStream,
++                autoOffsetStream: audio
++                    ? null
++                    : _activeBackend?.subtitleAutoOffsetStream,
+                 onDelayChanged: (d) => _applyDelay(audio: audio, delay: d),
+                 formatDelay: _formatDelay,
+               ),
+@@ -7691,7 +7757,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
+         CastTargetKind.dlna => 'DLNA',
+         _ => l10n.cast,
+       };
+-      _showThrottledCastError(l10n.castActionFailed(label, describeError(e, l10n)));
++      _showThrottledCastError(
++        l10n.castActionFailed(label, describeError(e, l10n)),
++      );
+     }
+   }
+ 
+diff --git a/lib/ui/widgets/playback/volume_guard_control.dart b/lib/ui/widgets/playback/volume_guard_control.dart
+new file mode 100644
+index 0000000..d4f8940
+--- /dev/null
++++ b/lib/ui/widgets/playback/volume_guard_control.dart
+@@ -0,0 +1,51 @@
++import 'package:flutter/material.dart';
++
++import '../../../playback/volume_guard_controller.dart';
++import '../track_selector_dialog.dart';
++
++String volumeGuardModeLabel(VolumeGuardMode mode) => switch (mode) {
++  VolumeGuardMode.off => 'Off',
++  VolumeGuardMode.balanced => 'Balanced',
++  VolumeGuardMode.night => 'Night',
++  VolumeGuardMode.auto => 'Auto',
++};
++
++/// Uses the same focus-restoring, remote-friendly choices as audio tracks.
++Future<void> showVolumeGuardControl(
++  BuildContext context,
++  VolumeGuardController controller, {
++  required bool Function() isCurrent,
++}) async {
++  final selected = await TrackSelectorDialog.show(
++    context,
++    title: 'Volume Guard',
++    selectedIndex: VolumeGuardMode.values.indexOf(controller.mode),
++    options: const [
++      TrackOption(label: 'Off', subtitle: 'Original audio levels'),
++      TrackOption(
++        label: 'Balanced',
++        subtitle: 'Level quiet dialogue and sudden loud sounds',
++      ),
++      TrackOption(
++        label: 'Night',
++        subtitle: 'Stronger leveling for quieter listening',
++      ),
++      TrackOption(label: 'Auto', subtitle: 'Follow your night schedule'),
++    ],
++    footer: AnimatedBuilder(
++      animation: controller,
++      builder: (context, _) => Padding(
++        padding: const EdgeInsets.fromLTRB(24, 12, 24, 8),
++        child: Text(
++          '${controller.statusLabel}\n\n'
++          'Set schedules in Jellyfin Dashboard → Plugins → Volume Guard. '
++          'Processing uses decoded audio; surround passthrough is unavailable.',
++          style: const TextStyle(color: Colors.white70, fontSize: 13),
++        ),
++      ),
++    ),
++  );
++  if (selected != null && context.mounted && isCurrent()) {
++    await controller.setMode(VolumeGuardMode.values[selected]);
++  }
++}
+diff --git a/packages/moonfin_native_video/android/src/main/java/org/moonfin/nativevideo/volumeguard/VolumeGuardAudioProcessor.java b/packages/moonfin_native_video/android/src/main/java/org/moonfin/nativevideo/volumeguard/VolumeGuardAudioProcessor.java
+new file mode 100644
+index 0000000..8f8fdc8
+--- /dev/null
++++ b/packages/moonfin_native_video/android/src/main/java/org/moonfin/nativevideo/volumeguard/VolumeGuardAudioProcessor.java
+@@ -0,0 +1,32 @@
++package org.moonfin.nativevideo.volumeguard;
++
++import androidx.media3.common.C;
++import androidx.media3.common.audio.BaseAudioProcessor;
++import androidx.media3.common.audio.AudioProcessor.AudioFormat;
++import androidx.media3.common.audio.AudioProcessor.UnhandledAudioFormatException;
++import androidx.media3.common.util.UnstableApi;
++import java.nio.ByteBuffer;
++
++@UnstableApi
++public final class VolumeGuardAudioProcessor extends BaseAudioProcessor {
++    public final VolumeGuardDsp dsp = new VolumeGuardDsp();
++    private float[] frame = new float[2];
++    @Override protected AudioFormat onConfigure(AudioFormat format) throws UnhandledAudioFormatException {
++        if (format.encoding != C.ENCODING_PCM_16BIT) throw new UnhandledAudioFormatException(format);
++        frame = new float[format.channelCount];
++        return format; // Always active: mode changes do not require rebuilding the player.
++    }
++    @Override public void queueInput(ByteBuffer input) {
++        int bytes = input.remaining();
++        int frameBytes = inputAudioFormat.channelCount * 2;
++        if (bytes % frameBytes != 0) throw new IllegalArgumentException("Incomplete PCM frame");
++        ByteBuffer output = replaceOutputBuffer(bytes);
++        while (input.hasRemaining()) {
++            for (int c = 0; c < frame.length; c++) frame[c] = input.getShort() / 32768f;
++            dsp.processFrame(frame, frame.length);
++            for (float value : frame) output.putShort((short) Math.max(-32768, Math.min(32767, Math.round(value * 32768))));
++        }
++        output.flip();
++    }
++    @Override protected void onFlush() { dsp.reset(inputAudioFormat.sampleRate); }
++}
+diff --git a/packages/moonfin_native_video/android/src/main/java/org/moonfin/nativevideo/volumeguard/VolumeGuardDsp.java b/packages/moonfin_native_video/android/src/main/java/org/moonfin/nativevideo/volumeguard/VolumeGuardDsp.java
+new file mode 100644
+index 0000000..9aabd1e
+--- /dev/null
++++ b/packages/moonfin_native_video/android/src/main/java/org/moonfin/nativevideo/volumeguard/VolumeGuardDsp.java
+@@ -0,0 +1,63 @@
++package org.moonfin.nativevideo.volumeguard;
++
++/** Streaming RMS leveling and linked sample-peak protection. Does not measure LUFS or true peaks. */
++public final class VolumeGuardDsp {
++    public static final class Profile {
++        public final boolean enabled;
++        public final double targetDb, maxGainDb, ceilingDb, attackMs, releaseMs;
++        public Profile(boolean enabled, double targetDb, double maxGainDb, double ceilingDb, double attackMs, double releaseMs) {
++            this.enabled = enabled;
++            this.targetDb = finite(targetDb, -40, -6, -20);
++            this.maxGainDb = finite(maxGainDb, 0, 24, 6);
++            this.ceilingDb = finite(ceilingDb, -20, 0, -1);
++            this.attackMs = finite(attackMs, 1, 200, 10);
++            this.releaseMs = finite(releaseMs, 20, 5000, 500);
++        }
++        private static double finite(double x, double min, double max, double fallback) {
++            return Double.isFinite(x) ? Math.max(min, Math.min(max, x)) : fallback;
++        }
++    }
++    public static final Profile OFF = new Profile(false, -20, 0, -1, 50, 1000);
++    public static final Profile BALANCED = new Profile(true, -20, 6, -1, 10, 500);
++    public static final Profile NIGHT = new Profile(true, -26, 9, -4, 5, 800);
++    private volatile Profile profile = OFF;
++    private double energy, gainDb, peakGain = 1, wet;
++    private int sampleRate = 48000;
++
++    public void setProfile(Profile value) { profile = value == null ? OFF : value; }
++    public void reset(int rate) {
++        sampleRate = Math.max(8000, rate);
++        energy = 0; gainDb = 0; peakGain = 1; wet = 0;
++    }
++
++    /** One interleaved frame; every channel receives the same gain to preserve spatial balance. */
++    public void processFrame(float[] samples, int channels) {
++        Profile p = profile;
++        double power = 0, peak = 0;
++        for (int c = 0; c < channels; c++) {
++            if (!Float.isFinite(samples[c])) samples[c] = 0;
++            double v = samples[c];
++            power += v * v; peak = Math.max(peak, Math.abs(v));
++        }
++        power /= channels;
++        double meter = Math.exp(-1.0 / (sampleRate * 0.4));
++        energy = meter * energy + (1 - meter) * power;
++        // Silence gate: do not chase noise during pauses. Limiting remains active.
++        if (power > 0.0000031623 && energy > 1e-10) {
++            double wanted = Math.max(-24, Math.min(p.maxGainDb, p.targetDb - 10 * Math.log10(energy)));
++            double smoothing = Math.exp(-1.0 / (sampleRate * (wanted < gainDb ? p.attackMs : p.releaseMs) / 1000));
++            gainDb = smoothing * gainDb + (1 - smoothing) * wanted;
++        }
++        double levelGain = Math.pow(10, gainDb / 20);
++        double ceiling = Math.pow(10, p.ceilingDb / 20);
++        double needed = peak == 0 ? 1 : Math.min(1, ceiling / (peak * levelGain));
++        peakGain = needed < peakGain ? needed : needed + (peakGain - needed) * Math.exp(-1.0 / (sampleRate * .08));
++        wet += ((p.enabled ? 1 : 0) - wet) * (1 - Math.exp(-1.0 / (sampleRate * .02)));
++        if (!p.enabled && wet < .00001) wet = 0;
++        double applied = 1 + wet * (levelGain * peakGain - 1);
++        // Final linked sample cap also covers profile changes and the bypass crossfade.
++        double rampCeiling = p.enabled ? ceiling : 1 + wet * (ceiling - 1);
++        if (peak * applied > rampCeiling) applied = rampCeiling / peak;
++        for (int c = 0; c < channels; c++) samples[c] *= (float) applied;
++    }
++}
+diff --git a/packages/moonfin_native_video/android/src/main/java/org/moonfin/nativevideo/volumeguard/VolumeGuardSchedule.java b/packages/moonfin_native_video/android/src/main/java/org/moonfin/nativevideo/volumeguard/VolumeGuardSchedule.java
+new file mode 100644
+index 0000000..bf87ddb
+--- /dev/null
++++ b/packages/moonfin_native_video/android/src/main/java/org/moonfin/nativevideo/volumeguard/VolumeGuardSchedule.java
+@@ -0,0 +1,20 @@
++package org.moonfin.nativevideo.volumeguard;
++
++import java.time.LocalTime;
++import java.time.ZonedDateTime;
++
++/** Membership is evaluated from an instant, in the schedule's zone. Sunday is zero. */
++public final class VolumeGuardSchedule {
++    private VolumeGuardSchedule() { }
++    public static boolean isActive(ZonedDateTime now, LocalTime start, LocalTime end, int[] days) {
++        int day = now.getDayOfWeek().getValue() % 7;
++        LocalTime time = now.toLocalTime();
++        if (start.equals(end)) return false;
++        if (start.isBefore(end)) return contains(days, day) && !time.isBefore(start) && time.isBefore(end);
++        return (contains(days, day) && !time.isBefore(start)) || (contains(days, (day + 6) % 7) && time.isBefore(end));
++    }
++    private static boolean contains(int[] days, int day) {
++        for (int value : days) if (value == day) return true;
++        return false;
++    }
++}
+diff --git a/packages/moonfin_native_video/android/src/main/kotlin/org/moonfin/nativevideo/Media3Bridge.kt b/packages/moonfin_native_video/android/src/main/kotlin/org/moonfin/nativevideo/Media3Bridge.kt
+index 5fe66e1..6346517 100644
+--- a/packages/moonfin_native_video/android/src/main/kotlin/org/moonfin/nativevideo/Media3Bridge.kt
++++ b/packages/moonfin_native_video/android/src/main/kotlin/org/moonfin/nativevideo/Media3Bridge.kt
+@@ -5,8 +5,27 @@ import android.os.Looper
+ import io.flutter.plugin.common.EventChannel
+ import io.flutter.plugin.common.MethodCall
+ import io.flutter.plugin.common.MethodChannel
++import org.moonfin.nativevideo.volumeguard.VolumeGuardDsp
+ 
+ object Media3Bridge {
++    @Volatile
++    private var volumeGuardProfileValue = VolumeGuardDsp.OFF
++
++    fun volumeGuardProfile(): VolumeGuardDsp.Profile = volumeGuardProfileValue
++
++    fun updateVolumeGuardProfile(arguments: Any?) {
++        val args = arguments as? Map<*, *> ?: emptyMap<Any, Any>()
++        fun number(key: String, fallback: Double): Double =
++            (args[key] as? Number)?.toDouble() ?: fallback
++        volumeGuardProfileValue = VolumeGuardDsp.Profile(
++            args["enabled"] == true,
++            number("targetDb", -20.0),
++            number("maxGainDb", 6.0),
++            number("ceilingDb", -1.0),
++            number("attackMs", 10.0),
++            number("releaseMs", 500.0),
++        )
++    }
+     private val mainHandler = Handler(Looper.getMainLooper())
+ 
+     private val fallbackState = mapOf(
+@@ -206,6 +225,14 @@ object Media3Bridge {
+     }
+ 
+     fun handleMethodCall(call: MethodCall, result: MethodChannel.Result) {
++        if (call.method == "setVolumeGuard") {
++            // Remember the policy even before a platform view exists. Replacement
++            // views also read this value, so a handover cannot revert to Off.
++            updateVolumeGuardProfile(call.arguments)
++            activeView?.handleQueuedCall(call.method, call.arguments)
++            result.success(null)
++            return
++        }
+         if (call.method == "activateView") {
+             val id = ((call.arguments as? Map<*, *>)?.get("viewId") as? Number)?.toInt()
+             val view = id?.let { viewRegistry[it] }
+diff --git a/packages/moonfin_native_video/android/src/main/kotlin/org/moonfin/nativevideo/Media3VideoView.kt b/packages/moonfin_native_video/android/src/main/kotlin/org/moonfin/nativevideo/Media3VideoView.kt
+index 52d8423..8c749f2 100644
+--- a/packages/moonfin_native_video/android/src/main/kotlin/org/moonfin/nativevideo/Media3VideoView.kt
++++ b/packages/moonfin_native_video/android/src/main/kotlin/org/moonfin/nativevideo/Media3VideoView.kt
+@@ -113,12 +113,14 @@ import org.moonfin.nativevideo.subtitle.joinStackedCues
+ import org.moonfin.nativevideo.subtitle.shouldRetime
+ import org.moonfin.nativevideo.subtitle.sourceTreeFor
+ import org.moonfin.nativevideo.subtitle.syncDelaysPayload
++import org.moonfin.nativevideo.volumeguard.VolumeGuardAudioProcessor
+ 
+ @OptIn(ExperimentalApi::class)
+ private class MoonfinRenderersFactory(
+     context: Context,
+     private val audioDelayProcessor: AdjustableAudioDelayProcessor,
+     private val channelMixingProcessor: ChannelMixingAudioProcessor,
++    private val volumeGuardProcessor: VolumeGuardAudioProcessor,
+     private val preferSoftwareAv1Renderer: Boolean,
+     private val passthroughPolicy: AudioPassthroughPolicy,
+     private val stereoDownmixRequested: () -> Boolean,
+@@ -225,20 +227,17 @@ private class MoonfinRenderersFactory(
+         val sinkBuilder = DefaultAudioSink.Builder(context)
+             .setAudioProcessorChain(
+                 DefaultAudioSink.DefaultAudioProcessorChain(
+-                    // Downmix runs first (on decoded multichannel PCM), then the
+-                    // delay processor. The mixer is inactive (identity) unless a
+-                    // stereo downmix is requested by preference or after an
+-                    // AudioTrack init failure. It never collides with the two
+-                    // paths that own their own channel handling: bitstreamed
+-                    // audio skips the processor chain outright, and a requested
+-                    // downmix steers surround to the platform decoder rather
+-                    // than to FFmpeg.
++                    // Downmix first, then linked gain/limiting, then audio delay.
++                    // The mixer stays inactive unless stereo is requested or
++                    // required by the output route. The outer sink vetoes all
++                    // compressed/offloaded formats, including in Off mode.
+                     channelMixingProcessor,
++                    volumeGuardProcessor,
+                     audioDelayProcessor,
+                 ),
+             )
+-            .setEnableFloatOutput(enableFloatOutput)
+-            .setEnableAudioOutputPlaybackParameters(enableAudioOutputPlaybackParams)
++            .setEnableFloatOutput(false)
++            .setEnableAudioOutputPlaybackParameters(false)
+         if (iecOutputProvider != null) {
+             // App-side IEC 61937 packing for eligible bitstreams. Everything
+             // else routes to the stock provider inside, and when the provider
+@@ -262,9 +261,9 @@ private class MoonfinRenderersFactory(
+         // stays authoritative. The recovery wrapper forwards every probe
+         // call untouched, so it rides along in every mode.
+         if (passthroughPolicy.mode == PassthroughMode.AUTO) {
+-            return recovering
++            return VolumeGuardAudioSink(recovering)
+         }
+-        return PassthroughPolicyAudioSink(recovering, passthroughPolicy)
++        return VolumeGuardAudioSink(PassthroughPolicyAudioSink(recovering, passthroughPolicy))
+     }
+ 
+     private fun buildAv1ExtensionRenderer(
+@@ -762,6 +761,9 @@ class Media3VideoView(
+     // playback.
+     private lateinit var trackSelector: DefaultTrackSelector
+     private val audioPipeline = ExoPlayerAudioPipeline()
++    private val volumeGuardProcessor = VolumeGuardAudioProcessor().apply {
++        dsp.setProfile(Media3Bridge.volumeGuardProfile())
++    }
+     private val audioAttributeState = AudioAttributeState()
+     private var preferFfmpegDecoder = Media3Bridge.preferFfmpegDecoderEnabled()
+     @Volatile
+@@ -1159,7 +1161,7 @@ class Media3VideoView(
+         }
+ 
+         override fun onAudioSessionIdChanged(audioSessionId: Int) {
+-            audioPipeline.setAudioSessionId(audioSessionId)
++            // No post-limiter LoudnessEnhancer: it could boost peaks above the ceiling.
+             if (currentAudioSessionId != audioSessionId) {
+                 if (
+                     openedAudioEffectSessionId != C.AUDIO_SESSION_ID_UNSET &&
+@@ -1759,15 +1761,13 @@ class Media3VideoView(
+             passthroughMode,
+             passthroughCodecs,
+         )
+-        iecOutputProvider = if (passthroughOutput == "iec" && Build.VERSION.SDK_INT >= 24) {
+-            Iec61937AudioOutputProvider(context)
+-        } else {
+-            null
+-        }
++        // Volume Guard requires decoded PCM rather than packed bitstreams.
++        iecOutputProvider = null
+         val renderersFactory = MoonfinRenderersFactory(
+             context = context,
+             audioDelayProcessor = audioDelayProcessor,
+             channelMixingProcessor = channelMixingProcessor,
++            volumeGuardProcessor = volumeGuardProcessor,
+             preferSoftwareAv1Renderer = !hasHardwareAv1Decoder,
+             passthroughPolicy = passthroughPolicy,
+             stereoDownmixRequested = ::effectiveStereoDownmix,
+@@ -1999,6 +1999,10 @@ class Media3VideoView(
+     fun handleControlCall(call: MethodCall, result: MethodChannel.Result) {
+         try {
+             when (call.method) {
++                "setVolumeGuard" -> {
++                    applyVolumeGuard(call.arguments)
++                    result.success(null)
++                }
+                 "setSource" -> {
+                     setSource(call.arguments)
+                     result.success(null)
+@@ -2206,6 +2210,7 @@ class Media3VideoView(
+     fun handleQueuedCall(method: String, args: Any?) {
+         try {
+             when (method) {
++                "setVolumeGuard" -> applyVolumeGuard(args)
+                 "setSource" -> setSource(args)
+                 "play" -> {
+                     player.playWhenReady = true
+@@ -2783,31 +2788,14 @@ class Media3VideoView(
+         }
+     }
+ 
+-    private fun openExternalAudioEffectSessionIfNeeded() {
+-        if (!allowExternalAudioEffects) {
+-            return
+-        }
+-        val sessionId = currentAudioSessionId
+-        if (sessionId == C.AUDIO_SESSION_ID_UNSET || sessionId <= 0) {
+-            return
+-        }
+-        if (openedAudioEffectSessionId == sessionId) {
+-            return
+-        }
++    private fun applyVolumeGuard(arguments: Any?) {
++        Media3Bridge.updateVolumeGuardProfile(arguments)
++        volumeGuardProcessor.dsp.setProfile(Media3Bridge.volumeGuardProfile())
++    }
+ 
++    private fun openExternalAudioEffectSessionIfNeeded() {
++        // External effects run after our limiter and can invalidate its ceiling.
+         closeExternalAudioEffectSessionIfOpen()
+-        val opened = runCatching {
+-            context.sendBroadcast(
+-                Intent(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION).apply {
+-                    putExtra(AudioEffect.EXTRA_AUDIO_SESSION, sessionId)
+-                    putExtra(AudioEffect.EXTRA_PACKAGE_NAME, context.packageName)
+-                    putExtra(AudioEffect.EXTRA_CONTENT_TYPE, audioEffectContentType())
+-                },
+-            )
+-        }.isSuccess
+-        if (opened) {
+-            openedAudioEffectSessionId = sessionId
+-        }
+     }
+ 
+     private fun closeExternalAudioEffectSessionIfOpen() {
+@@ -2829,31 +2817,13 @@ class Media3VideoView(
+     }
+ 
+     private fun applyTrackSelectorForCurrentSource() {
+-        val isAudioContent = currentMediaType == "audio"
+-        val hasExternalSubtitle = selectedSubtitleIsExternal ||
+-            !selectedExternalSubtitleUrl.isNullOrBlank() ||
+-            externalSubtitleConfigurations.isNotEmpty()
+-        val shouldEnableTunneling =
+-            !isAudioContent &&
+-                !hasExternalSubtitle &&
+-                !sessionTunnelingDisabled &&
+-                // Tunneled TrueHD/MLP passthrough can be silent with no sink
+-                // exception on some AVR chains. Tunneling is only a latency
+-                // optimization, so drop it whenever a lossless track is active.
+-                !currentAudioIsLossless &&
+-                // App-side IEC packing writes PCM-shaped bursts that must
+-                // never get HW_AV_SYNC headers, so tunneling stays off while
+-                // the IEC output mode is live (it returns after the session
+-                // fallback disables IEC).
+-                (iecOutputProvider?.sessionIecDisabled != false)
++        // Tunneling and offload bypass the PCM processor chain.
++        val shouldEnableTunneling = false
+ 
+         tunnelingActive = shouldEnableTunneling
+ 
+-        val offloadMode = if (isAudioContent && !audioOffloadDisabled) {
+-            TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED
+-        } else {
++        val offloadMode =
+             TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_DISABLED
+-        }
+ 
+         val parametersBuilder = trackSelector.buildUponParameters()
+             .setAudioOffloadPreferences(
+diff --git a/packages/moonfin_native_video/android/src/main/kotlin/org/moonfin/nativevideo/VolumeGuardAudioSink.kt b/packages/moonfin_native_video/android/src/main/kotlin/org/moonfin/nativevideo/VolumeGuardAudioSink.kt
+new file mode 100644
+index 0000000..a2d9328
+--- /dev/null
++++ b/packages/moonfin_native_video/android/src/main/kotlin/org/moonfin/nativevideo/VolumeGuardAudioSink.kt
+@@ -0,0 +1,22 @@
++package org.moonfin.nativevideo
++
++import androidx.media3.common.Format
++import androidx.media3.common.MimeTypes
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.audio.AudioOffloadSupport
++import androidx.media3.exoplayer.audio.AudioSink
++import androidx.media3.exoplayer.audio.ForwardingAudioSink
++
++/** Every mode, including Off, keeps decoded PCM available for seamless toggles. */
++@UnstableApi
++internal class VolumeGuardAudioSink(delegate: AudioSink) : ForwardingAudioSink(delegate) {
++    override fun supportsFormat(format: Format): Boolean =
++        format.sampleMimeType == MimeTypes.AUDIO_RAW && super.supportsFormat(format)
++
++    override fun getFormatSupport(format: Format): Int =
++        if (format.sampleMimeType == MimeTypes.AUDIO_RAW) super.getFormatSupport(format)
++        else AudioSink.SINK_FORMAT_UNSUPPORTED
++
++    override fun getFormatOffloadSupport(format: Format): AudioOffloadSupport =
++        AudioOffloadSupport.DEFAULT_UNSUPPORTED
++}
+diff --git a/packages/moonfin_native_video/android/src/test/java/org/moonfin/nativevideo/volumeguard/VolumeGuardDspChecks.java b/packages/moonfin_native_video/android/src/test/java/org/moonfin/nativevideo/volumeguard/VolumeGuardDspChecks.java
+new file mode 100644
+index 0000000..38a81c7
+--- /dev/null
++++ b/packages/moonfin_native_video/android/src/test/java/org/moonfin/nativevideo/volumeguard/VolumeGuardDspChecks.java
+@@ -0,0 +1,77 @@
++package org.moonfin.nativevideo.volumeguard;
++import org.moonfin.nativevideo.volumeguard.VolumeGuardDsp;
++import org.moonfin.nativevideo.volumeguard.VolumeGuardSchedule;
++import java.time.*;
++
++/** Dependency-free JVM checks. Run with assertions always on through this explicit check helper. */
++public final class VolumeGuardDspChecks {
++    private static void check(boolean condition, String message) {
++        if (!condition) throw new AssertionError(message);
++    }
++    private static double amplitude(double db) { return Math.pow(10, db / 20); }
++    private static void settle(VolumeGuardDsp dsp, int rate, int channels, float value, int seconds) {
++        float[] frame = new float[channels];
++        for (int i = 0; i < rate * seconds; i++) {
++            for (int c = 0; c < channels; c++) frame[c] = value;
++            dsp.processFrame(frame, channels);
++        }
++    }
++    public static void main(String[] args) {
++        for (int rate : new int[]{8000, 48000, 192000}) {
++            VolumeGuardDsp dsp = new VolumeGuardDsp();
++            dsp.reset(rate);
++            dsp.setProfile(VolumeGuardDsp.OFF);
++            float[] off = {.25f, -.75f};
++            dsp.processFrame(off, 2);
++            check(off[0] == .25f && off[1] == -.75f, "Off must bypass exactly");
++
++            dsp.setProfile(VolumeGuardDsp.NIGHT);
++            float[] coldPeak = {1, -1};
++            dsp.processFrame(coldPeak, 2);
++            check(Math.abs(coldPeak[0]) <= amplitude(-4) + .00001, "First frame must already obey ceiling");
++            settle(dsp, rate, 6, .01f, 5);
++            float[] quiet = {.01f, .005f, -.01f, 0, .003f, -.002f};
++            dsp.processFrame(quiet, 6);
++            check(quiet[0] > .012f, "Quiet audio should receive useful gain");
++            check(quiet[0] <= .01 * amplitude(9) + .00001, "Gain must stay within configured maximum");
++            check(Math.abs(quiet[0] / quiet[1] - 2) < .0001, "Linked gain must preserve channels");
++
++            double ceiling = amplitude(-4);
++            for (int i = 0; i < 500; i++) {
++                float[] peak = {1, -.5f, .25f, 0, .9f, -.8f};
++                dsp.processFrame(peak, 6);
++                for (float v : peak) check(Math.abs(v) <= ceiling + .00001, "Sudden peak must obey sample ceiling");
++                check(Math.abs(peak[0] / peak[1] + 2) < .0001, "Limiting must preserve channel ratios");
++            }
++            settle(dsp, rate, 2, 0, 4);
++            float[] silence = {0, 0};
++            dsp.processFrame(silence, 2);
++            check(silence[0] == 0 && silence[1] == 0, "Silence must remain silent");
++            float[] bad = {Float.NaN, Float.POSITIVE_INFINITY};
++            dsp.processFrame(bad, 2);
++            check(Float.isFinite(bad[0]) && Float.isFinite(bad[1]), "Nonfinite input must not poison DSP");
++
++            dsp.setProfile(VolumeGuardDsp.OFF);
++            settle(dsp, rate, 2, .1f, 1);
++            float[] returned = {.1f, -.2f};
++            dsp.processFrame(returned, 2);
++            check(returned[0] == .1f && returned[1] == -.2f, "Ramp must settle to exact bypass");
++        }
++        VolumeGuardDsp.Profile invalid = new VolumeGuardDsp.Profile(true, Double.NaN, Double.POSITIVE_INFINITY, 20, -1, 0);
++        check(Double.isFinite(invalid.targetDb) && invalid.maxGainDb <= 24 && invalid.ceilingDb <= 0, "Unsafe policy values must be bounded");
++        LocalTime start = LocalTime.of(22, 0), end = LocalTime.of(7, 0);
++        check(VolumeGuardSchedule.isActive(ZonedDateTime.parse("2026-10-20T06:59:59Z"), start, end, new int[]{1}), "Tuesday morning belongs to Monday window");
++        check(!VolumeGuardSchedule.isActive(ZonedDateTime.parse("2026-10-20T07:00:00Z"), start, end, new int[]{1}), "End is exclusive");
++        check(!VolumeGuardSchedule.isActive(ZonedDateTime.parse("2026-10-19T06:00:00Z"), start, end, new int[]{1}), "Monday morning does not belong to Monday night");
++        check(VolumeGuardSchedule.isActive(ZonedDateTime.parse("2026-10-18T01:00:00Z"), start, end, new int[]{6}), "Saturday wraps to Sunday");
++        check(!VolumeGuardSchedule.isActive(ZonedDateTime.parse("2026-10-18T01:00:00Z"), start, end, new int[]{}), "Empty schedule inactive");
++        ZoneId eastern = ZoneId.of("America/New_York");
++        for (String instant : new String[]{"2026-11-01T05:30:00Z", "2026-11-01T06:30:00Z"}) {
++            check(VolumeGuardSchedule.isActive(Instant.parse(instant).atZone(eastern), LocalTime.of(1, 0), LocalTime.of(3, 0), new int[]{0}), "Both occurrences of repeated DST hour");
++        }
++        check(!VolumeGuardSchedule.isActive(Instant.parse("2026-03-08T07:00:00Z").atZone(eastern), LocalTime.of(1, 0), LocalTime.of(3, 0), new int[]{0}), "DST jump reaches exclusive end");
++        check(!VolumeGuardSchedule.isActive(ZonedDateTime.parse("2026-10-19T12:00:00Z"), start, start, new int[]{1}), "Equal times are inactive");
++        System.out.println("VolumeGuardDsp: all checks passed (8/48/192 kHz; stereo and six-channel PCM)");
++        System.out.println("VolumeGuardSchedule: overnight, boundaries, week wrap and DST checks passed");
++    }
++}
+diff --git a/packages/moonfin_native_video/android/src/test/java/org/moonfin/nativevideo/volumeguard/VolumeGuardDspTest.java b/packages/moonfin_native_video/android/src/test/java/org/moonfin/nativevideo/volumeguard/VolumeGuardDspTest.java
+new file mode 100644
+index 0000000..f3ad557
+--- /dev/null
++++ b/packages/moonfin_native_video/android/src/test/java/org/moonfin/nativevideo/volumeguard/VolumeGuardDspTest.java
+@@ -0,0 +1,9 @@
++package org.moonfin.nativevideo.volumeguard;
++
++import org.junit.Test;
++
++public final class VolumeGuardDspTest {
++    @Test public void streamingAudioAndScheduleRegressions() {
++        VolumeGuardDspChecks.main(new String[0]);
++    }
++}
+diff --git a/packages/moonfin_native_video/lib/moonfin_native_video.dart b/packages/moonfin_native_video/lib/moonfin_native_video.dart
+index 033b171..663002b 100644
+--- a/packages/moonfin_native_video/lib/moonfin_native_video.dart
++++ b/packages/moonfin_native_video/lib/moonfin_native_video.dart
+@@ -1,3 +1,4 @@
+ export 'src/native_video_view.dart';
+ export 'src/media3_video_view.dart';
+ export 'src/unscaled_platform_view.dart';
++export 'src/native_video_plugin.dart';
+diff --git a/packages/moonfin_native_video/lib/src/native_video_plugin.dart b/packages/moonfin_native_video/lib/src/native_video_plugin.dart
+new file mode 100644
+index 0000000..1f379ee
+--- /dev/null
++++ b/packages/moonfin_native_video/lib/src/native_video_plugin.dart
+@@ -0,0 +1,9 @@
++import 'package:flutter/services.dart';
++
++/// Native Media3 audio controls; other player engines do not implement these.
++class NativeVideoPlugin {
++  static const _control = MethodChannel('moonfin/media3_video_control');
++
++  static Future<void> setVolumeGuard(Map<String, dynamic> profile) =>
++      _control.invokeMethod<void>('setVolumeGuard', profile);
++}
+diff --git a/pubspec.lock b/pubspec.lock
+index dc5f0d6..eb83c0c 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -1926,7 +1926,7 @@ packages:
+     source: hosted
+     version: "0.7.12"
+   timezone:
+-    dependency: transitive
++    dependency: "direct main"
+     description:
+       name: timezone
+       sha256: "784a5e34d2eb62e1326f24d6f600aaaee452eb8ca8ef2f384a59244e292d158b"
+diff --git a/pubspec.yaml b/pubspec.yaml
+index e3b7f4c..9360d40 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -37,6 +37,7 @@ dependencies:
+ 
+   # Local Storage
+   shared_preferences: ^2.5.5
++  timezone: ^0.11.0
+   flutter_secure_storage: ^10.0.0
+   path: ^1.9.1
+   path_provider: ^2.1.5
+diff --git a/test/playback/volume_guard_controller_test.dart b/test/playback/volume_guard_controller_test.dart
+new file mode 100644
+index 0000000..aae7927
+--- /dev/null
++++ b/test/playback/volume_guard_controller_test.dart
+@@ -0,0 +1,288 @@
++import 'dart:async';
++
++import 'package:dio/dio.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:moonfin/playback/volume_guard_controller.dart';
++import 'package:shared_preferences/shared_preferences.dart';
++import 'package:timezone/data/latest.dart' as tzdata;
++
++Map<String, dynamic> _config({
++  String zone = 'America/New_York',
++  List<int> days = const [0, 1, 2, 3, 4, 5, 6],
++  String start = '22:00',
++  String end = '07:00',
++}) => {
++  'timeZoneId': zone,
++  'scheduleEnabled': true,
++  'daytimeMode': 'Balanced',
++  'nightWindows': [
++    {'days': days, 'start': start, 'end': end},
++  ],
++  'balanced': {
++    'targetRmsDb': -20,
++    'maxGainDb': 6,
++    'limiterCeilingDb': -1,
++    'attackMs': 10,
++    'releaseMs': 500,
++  },
++  'night': {
++    'targetRmsDb': -26,
++    'maxGainDb': 9,
++    'limiterCeilingDb': -4,
++    'attackMs': 5,
++    'releaseMs': 800,
++  },
++};
++
++Map<String, dynamic> _policy() => {
++  'schemaVersion': 1,
++  'enabled': true,
++  'effectiveAutoMode': 'Night',
++  'configuration': _config(),
++};
++
++void main() {
++  TestWidgetsFlutterBinding.ensureInitialized();
++  setUp(() {
++    SharedPreferences.setMockInitialValues({});
++    tzdata.initializeTimeZones();
++  });
++
++  test('preserves reverse proxy base path', () {
++    expect(
++      VolumeGuardController.policyUri('https://example.com/jellyfin/')
++          .toString(),
++      'https://example.com/jellyfin/VolumeGuard/policy',
++    );
++  });
++
++  test('overnight schedule uses start day and exclusive end', () {
++    final config = _config(zone: 'UTC', days: [5]);
++    bool active(String instant) =>
++        VolumeGuardController.scheduleActive(config, DateTime.parse(instant));
++    expect(active('2026-10-23T21:59:59Z'), false);
++    expect(active('2026-10-23T22:00:00Z'), true);
++    expect(active('2026-10-24T06:59:59Z'), true);
++    expect(active('2026-10-24T07:00:00Z'), false);
++    expect(active('2026-10-24T22:00:00Z'), false);
++  });
++
++  test('same-day schedule and disabled schedule', () {
++    final config = _config(zone: 'UTC', start: '09:00', end: '17:00');
++    expect(
++      VolumeGuardController.scheduleActive(
++        config,
++        DateTime.utc(2026, 10, 23, 9),
++      ),
++      true,
++    );
++    expect(
++      VolumeGuardController.scheduleActive(
++        config,
++        DateTime.utc(2026, 10, 23, 17),
++      ),
++      false,
++    );
++    config['scheduleEnabled'] = false;
++    expect(
++      VolumeGuardController.scheduleActive(
++        config,
++        DateTime.utc(2026, 10, 23, 12),
++      ),
++      false,
++    );
++  });
++
++  test('both repeated DST hours match and spring gap skips naturally', () {
++    final autumn = _config(start: '01:00', end: '02:00');
++    for (final instant in ['2026-11-01T05:30:00Z', '2026-11-01T06:30:00Z']) {
++      expect(
++        VolumeGuardController.scheduleActive(autumn, DateTime.parse(instant)),
++        true,
++      );
++    }
++    expect(
++      VolumeGuardController.scheduleActive(
++        autumn,
++        DateTime.parse('2026-11-01T07:00:00Z'),
++      ),
++      false,
++    );
++    final spring = _config(start: '01:00', end: '03:00');
++    expect(
++      VolumeGuardController.scheduleActive(
++        spring,
++        DateTime.parse('2026-03-08T06:59:00Z'),
++      ),
++      true,
++    );
++    expect(
++      VolumeGuardController.scheduleActive(
++        spring,
++        DateTime.parse('2026-03-08T07:00:00Z'),
++      ),
++      false,
++    );
++  });
++
++  test(
++    'auth header, native profile, cached outage policy and scoped preference',
++    () async {
++      final requests = <RequestOptions>[];
++      var online = true;
++      final dio = Dio()
++        ..interceptors.add(
++          InterceptorsWrapper(
++            onRequest: (options, handler) {
++              requests.add(options);
++              if (online) {
++                handler.resolve(
++                  Response(requestOptions: options, data: _policy()),
++                );
++              } else {
++                handler.reject(DioException(requestOptions: options));
++              }
++            },
++          ),
++        );
++      final profiles = <Map<String, dynamic>>[];
++      VolumeGuardController controller(String user) => VolumeGuardController(
++        serverUrl: 'https://example.com/jellyfin',
++        accessToken: 'test-token',
++        userId: user,
++        deviceId: 'tv1',
++        dio: dio,
++        now: () => DateTime.utc(2026, 10, 24, 3),
++        applyProfile: (profile) async {
++          profiles.add(profile);
++        },
++      );
++      final first = controller('user1');
++      await first.start();
++      expect(requests.single.uri.path, '/jellyfin/VolumeGuard/policy');
++      expect(requests.single.headers['X-Emby-Token'], 'test-token');
++      expect(requests.single.followRedirects, false);
++      expect(first.usingServerPolicy, true);
++      expect(first.effectiveMode, VolumeGuardMode.night);
++      expect(profiles.last['ceilingDb'], -4);
++      await first.setMode(VolumeGuardMode.off);
++      expect(profiles.last['enabled'], false);
++      first.dispose();
++      online = false;
++      final cached = controller('user1');
++      await cached.start();
++      expect(cached.mode, VolumeGuardMode.off);
++      expect(cached.usingServerPolicy, true);
++      expect(cached.statusLabel, contains('cached'));
++      cached.dispose();
++      final other = controller('user2');
++      await other.start();
++      expect(other.mode, VolumeGuardMode.auto);
++      expect(other.usingServerPolicy, false);
++      other.dispose();
++      dio.close();
++    },
++  );
++
++  test('unknown server timezone uses its evaluated mode', () async {
++    final policy = _policy();
++    (policy['configuration'] as Map)['timeZoneId'] = 'Custom Windows Zone';
++    policy['effectiveAutoMode'] = 'Off';
++    final dio = Dio()
++      ..interceptors.add(
++        InterceptorsWrapper(
++          onRequest: (options, handler) {
++            handler.resolve(Response(requestOptions: options, data: policy));
++          },
++        ),
++      );
++    final controller = VolumeGuardController(
++      serverUrl: 'https://example.com',
++      accessToken: 'token',
++      userId: 'user',
++      deviceId: 'tv',
++      dio: dio,
++      applyProfile: (_) async {},
++    );
++    await controller.start();
++    expect(controller.effectiveMode, VolumeGuardMode.off);
++    controller.dispose();
++    dio.close();
++  });
++
++  test(
++    'server default applies until a local override; master disable wins',
++    () async {
++      final policy = _policy()..['defaultMode'] = 'Night';
++      final dio = Dio()
++        ..interceptors.add(
++          InterceptorsWrapper(
++            onRequest: (options, handler) {
++              handler.resolve(Response(requestOptions: options, data: policy));
++            },
++          ),
++        );
++      final profiles = <Map<String, dynamic>>[];
++      final controller = VolumeGuardController(
++        serverUrl: 'https://example.com',
++        accessToken: 'token',
++        userId: 'user',
++        deviceId: 'tv',
++        dio: dio,
++        applyProfile: (profile) async {
++          profiles.add(profile);
++        },
++      );
++      await controller.start();
++      expect(controller.mode, VolumeGuardMode.night);
++      await controller.setMode(VolumeGuardMode.balanced);
++      await controller.refreshPolicy();
++      expect(controller.mode, VolumeGuardMode.balanced);
++      policy['enabled'] = false;
++      await controller.refreshPolicy();
++      expect(controller.effectiveMode, VolumeGuardMode.off);
++      expect(profiles.last['enabled'], false);
++      policy['enabled'] = true;
++      (policy['configuration'] as Map)['enabled'] = false;
++      await controller.refreshPolicy();
++      expect(controller.effectiveMode, VolumeGuardMode.off);
++      controller.dispose();
++      dio.close();
++    },
++  );
++
++  test('late network result cannot apply after disposal', () async {
++    final pending = Completer<void>();
++    RequestInterceptorHandler? handler;
++    RequestOptions? request;
++    final dio = Dio()
++      ..interceptors.add(
++        InterceptorsWrapper(
++          onRequest: (options, h) {
++            handler = h;
++            request = options;
++            pending.complete();
++          },
++        ),
++      );
++    var applies = 0;
++    final controller = VolumeGuardController(
++      serverUrl: 'https://example.com',
++      accessToken: 'token',
++      userId: 'user',
++      deviceId: 'tv',
++      dio: dio,
++      applyProfile: (_) async {
++        applies++;
++      },
++    );
++    final start = controller.start();
++    await pending.future;
++    controller.dispose();
++    final before = applies;
++    handler!.resolve(Response(requestOptions: request!, data: _policy()));
++    await start;
++    expect(applies, before);
++    dio.close();
++  });
++}
