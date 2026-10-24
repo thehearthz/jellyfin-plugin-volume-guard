@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Volume Guard</title></head><body>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Volume Guard</title></head><body>
 <div id="volumeGuardPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox,emby-select">
     <style>
         #volumeGuardPage .vg-content { max-width: 68em; margin: 0 auto; padding: 1.5em; }
@@ -20,6 +20,9 @@
         #volumeGuardPage .vg-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .75em; margin-block: 1em; }
         #volumeGuardPage button { min-height: 2.75em; }
         #volumeGuardPage .vg-notice { padding: 1em; background: rgba(128,128,128,.12); }
+        #volumeGuardPage .vg-device, #volumeGuardPage .vg-session { padding: 1em; margin-block: 1em; background: rgba(128,128,128,.08); overflow-wrap: anywhere; }
+        #volumeGuardPage .vg-session p { margin-block: .35em; }
+        #volumeGuardPage .vg-stamp { font-variant-numeric: tabular-nums; }
         #volumeGuardPage details summary { cursor: pointer; padding-block: .75em; }
         #volumeGuardPage :focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
         #volumeGuardPage [hidden] { display: none !important; }
@@ -28,28 +31,52 @@
     <div class="content-primary vg-content">
         <h1>Volume Guard</h1>
         <p>Level audio on the Jellyfin server and keep your standard Moonfin player.</p>
-        <p class="vg-notice">Server processing converts audio before sending it to your player. Video can remain unchanged where compatible. It uses server resources and replaces the original audio bitstream. Change these settings before starting playback; active streams keep their existing processing. This plugin cannot add buttons to Moonfin's player or preview screens.</p>
+        <p class="vg-notice">Server processing converts audio before sending it to your player. Video can remain unchanged where compatible. It uses server resources and replaces the original audio bitstream. Changes apply to new playback unless automatic switching is enabled below. This plugin cannot add buttons to Moonfin's player or preview screens.</p>
+        <section class="vg-section" aria-labelledby="vg-processing-heading">
+            <h2 id="vg-processing-heading">Playback status</h2>
+            <p class="vg-help">A processing status confirms the server launched an audio filter. It does not measure your speaker volume or prove the player is receiving processed sound.</p>
+            <div class="vg-actions"><button id="vg-refresh" type="button" is="emby-button" class="raised">Refresh playback status</button><span id="vg-freshness" class="vg-stamp" role="status" aria-live="polite">Status has not loaded.</span></div>
+            <p id="vg-status-error" role="alert" hidden></p>
+            <div id="vg-sessions"></div>
+            <p id="vg-analysis-status">Loudness analysis status has not loaded.</p>
+        </section>
         <form id="vg-form">
             <fieldset id="vg-settings" disabled style="border:0;padding:0;margin:0">
                 <section class="vg-section" aria-labelledby="vg-playback-heading">
                     <h2 id="vg-playback-heading">Listening controls</h2>
                     <label class="vg-check"><input id="vg-enabled" type="checkbox"><span>Enable Volume Guard</span></label>
-                    <p class="vg-help">Use this master switch to turn Volume Guard on or off before you play a show or movie. It applies to all users. Restart playback to apply a change.</p>
+                    <p class="vg-help">Use this master switch to turn Volume Guard on or off. It applies to all users. Start new playback to apply a change, or enable automatic switching below.</p>
                     <label class="vg-check"><input id="vg-server" type="checkbox"><span>Process audio on the Jellyfin server</span></label>
                     <p class="vg-help">Turn this on to use stock Moonfin without a companion app. It is off until you opt in. When enabled with an active listening mode, playback negotiation requests audio conversion instead of Direct Play; your user account must allow audio transcoding. Direct playback outside that negotiation path bypasses the effect.</p>
                     <div class="vg-fields">
                         <div class="vg-field"><label for="vg-mode">Listening mode</label><select id="vg-mode" is="emby-select"><option>Off</option><option>Balanced</option><option>Night</option><option>Auto</option></select><p class="vg-help">Choose Off for normal audio, Balanced for everyday leveling, Night for quieter listening, or Auto to follow your schedule. The mode is chosen when a new audio conversion starts.</p></div>
                         <div class="vg-field"><label for="vg-daytime">Daytime mode</label><select id="vg-daytime" is="emby-select"><option>Off</option><option>Balanced</option><option>Night</option></select><p class="vg-help">Balanced levels quieter passages gently. Night uses a quieter target and a lower peak ceiling.</p></div>
                     </div>
+                    <div class="vg-field"><label for="vg-dialogue">Dialogue boost (dB)</label><input id="vg-dialogue" type="number" is="emby-input" min="0" max="12" step="0.5" value="0" required><p class="vg-help">Use 0 to leave dialogue unchanged. Boosts speech frequencies and the center channel where available; it cannot separate voices from music in a mixed soundtrack. The peak limiter remains active.</p></div>
+                </section>
+                <section class="vg-section" aria-labelledby="vg-device-heading">
+                    <h2 id="vg-device-heading">Device settings</h2>
+                    <p class="vg-help">Devices without an override follow the listening controls above. An override cannot enable processing when the master switch or server processing is off. Refresh playback status to find connected devices, or enter a Jellyfin device ID manually.</p>
+                    <datalist id="vg-known-devices"></datalist>
+                    <div id="vg-devices"></div><p id="vg-devices-empty">No device overrides. All devices follow the global settings.</p>
+                    <button id="vg-add-device" type="button" is="emby-button" class="raised">Add device override</button>
                 </section>
                 <section class="vg-section" aria-labelledby="vg-schedule-heading">
                     <h2 id="vg-schedule-heading">Night schedule</h2>
                     <label class="vg-check"><input id="vg-schedule" type="checkbox"><span>Use scheduled night hours in Auto mode</span></label>
+                    <label class="vg-check"><input id="vg-switch" type="checkbox"><span>Switch modes during playback</span></label>
+                    <p class="vg-help">When a schedule or saved setting changes the active mode, request a brief playback restart on compatible clients. A restart may interrupt playback; clients that cannot restart must start new playback manually. Check playback status for the result.</p>
                     <div class="vg-field"><label for="vg-zone">Time zone (IANA name)</label><input id="vg-zone" is="emby-input" required autocomplete="off" placeholder="America/New_York" aria-describedby="vg-zone-help"><p id="vg-zone-help" class="vg-help">For example, America/New_York, Europe/London, or UTC. Daylight saving follows this time zone.</p></div>
                     <p id="vg-window-help" class="vg-help">Days are the days each window starts. Friday 22:00 to 07:00 ends Saturday morning. End times are exclusive; equal start and end times are not allowed.</p>
                     <div id="vg-windows" aria-describedby="vg-window-help"></div>
                     <p id="vg-empty" hidden>No night windows. Auto will use the daytime mode.</p>
                     <button id="vg-add" type="button" is="emby-button" class="raised">Add night window</button>
+                </section>
+                <section class="vg-section" aria-labelledby="vg-analysis-heading">
+                    <h2 id="vg-analysis-heading">Loudness analysis</h2>
+                    <label class="vg-check"><input id="vg-analysis" type="checkbox"><span>Use measured loudness for movies and episodes</span></label>
+                    <p class="vg-help">Run the Volume Guard loudness analysis task in Jellyfin Dashboard → Scheduled Tasks to measure supported local files. Analysis reads the audio and uses server resources; it does not change your media files. Cached measurements improve consistency between titles. Live TV and titles without a measurement continue using real-time leveling.</p>
+                    <div class="vg-field"><label for="vg-lufs">Measured loudness target (LUFS)</label><input id="vg-lufs" type="number" is="emby-input" min="-36" max="-10" step="0.5" value="-20" required><p class="vg-help">A lower number is quieter. This target guides measured title gain; compression and limiting still affect the final output.</p></div>
                 </section>
                 <details class="vg-section"><summary>Advanced audio profiles</summary>
                     <p class="vg-help">These are signal levels, not a room volume limit or measured LUFS loudness. Server audio is encoded after processing, so the final decoded peak can differ from the filter ceiling. Higher maximum gain can raise background noise. Keep the target at or below the peak ceiling.</p>
@@ -66,7 +93,7 @@
         'use strict';
         var page = document.getElementById('volumeGuardPage');
         var $ = function (id) { return page.querySelector('#vg-' + id); };
-        var loaded = false, dirty = false, busy = false, windowId = 0;
+        var loaded = false, dirty = false, busy = false, windowId = 0, deviceRowId = 0, statusBusy = false;
         var dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
         var profileFields = [
             ['targetRmsDb', 'Target RMS (dBFS)', -40, -6], ['maxGainDb', 'Maximum gain (dB)', 0, 24],
@@ -78,6 +105,21 @@
         function markDirty() { if (!loaded || busy) return; dirty = true; $('dirty').hidden = false; message('Changes have not been saved.'); error(''); }
         function setBusy(value) { busy = value; $('settings').disabled = value || !loaded; $('save').disabled = value || !loaded; $('reload').disabled = value; }
         function syncWindows() { $('empty').hidden = $('windows').children.length !== 0; $('add').disabled = $('windows').children.length >= 32; }
+        function syncDevices() { $('devices-empty').hidden = $('devices').children.length !== 0; $('add-device').disabled = $('devices').children.length >= 128; }
+        function addDevice(value) {
+            var id = ++deviceRowId, row = element('fieldset'), legend = element('legend', 'Device override'); row.className = 'vg-device'; row.appendChild(legend);
+            var grid = element('div'); grid.className = 'vg-fields';
+            [['deviceId', 'Jellyfin device ID'], ['deviceName', 'Device name (optional)'], ['mode', 'Listening mode'], ['dialogueBoostDb', 'Dialogue boost (dB)']].forEach(function (entry) {
+                var field = element('div'), label = element('label', entry[1]), input = element(entry[0] === 'mode' ? 'select' : 'input'); field.className = 'vg-field'; input.id = 'vg-device-' + id + '-' + entry[0]; input.className = 'vg-device-' + entry[0]; label.htmlFor = input.id;
+                if (entry[0] === 'mode') ['Auto', 'Balanced', 'Night', 'Off'].forEach(function (mode) { var option = element('option', mode); option.value = mode; input.appendChild(option); });
+                else if (entry[0] === 'dialogueBoostDb') { input.type = 'number'; input.min = 0; input.max = 12; input.step = '.5'; input.required = true; }
+                else { input.type = 'text'; input.maxLength = 256; if (entry[0] === 'deviceId') { input.required = true; input.setAttribute('list', 'vg-known-devices'); input.autocomplete = 'off'; } }
+                input.value = value[entry[0]] == null ? '' : value[entry[0]]; field.appendChild(label); field.appendChild(input); grid.appendChild(field);
+            }); row.appendChild(grid);
+            var label = element('label'), enabled = element('input'); label.className = 'vg-check'; enabled.type = 'checkbox'; enabled.className = 'vg-device-enabled'; enabled.checked = value.enabled !== false; label.appendChild(enabled); label.appendChild(element('span', 'Allow Volume Guard on this device')); row.appendChild(label);
+            var remove = element('button', 'Remove override'); remove.type = 'button'; remove.className = 'raised'; remove.addEventListener('click', function () { row.remove(); syncDevices(); markDirty(); }); row.appendChild(remove); $('devices').appendChild(row); syncDevices(); return row;
+        }
+        function number(id, min, max, label) { var raw = $(id).value, value = Number(raw); if (raw === '' || !Number.isFinite(value) || value < min || value > max) throw new Error(label + ' must be between ' + min + ' and ' + max + '.'); return value; }
         function addWindow(value) {
             var id = ++windowId, row = element('fieldset'), legend = element('legend', 'Night window'); row.className = 'vg-window'; row.appendChild(legend);
             var days = element('div'); days.className = 'vg-days';
@@ -91,8 +133,8 @@
             var group = element('fieldset'), legend = element('legend', profile === 'balanced' ? 'Balanced profile' : 'Night profile'), grid = element('div'); grid.className = 'vg-fields'; group.appendChild(legend);
             profileFields.forEach(function (entry) { var field = element('div'), label = element('label', entry[1]), input = element('input'); field.className = 'vg-field'; input.id = 'vg-' + profile + '-' + entry[0]; input.type = 'number'; input.min = entry[2]; input.max = entry[3]; input.step = 'any'; input.required = true; input.setAttribute('is', 'emby-input'); label.htmlFor = input.id; field.appendChild(label); field.appendChild(input); grid.appendChild(field); }); group.appendChild(grid); $('profiles').appendChild(group);
         });
-        function api(method, data) {
-            var options = { type: method, url: ApiClient.getUrl('VolumeGuard/configuration') };
+        function api(method, data, path) {
+            var options = { type: method, url: ApiClient.getUrl('VolumeGuard/' + (path || 'configuration')) };
             if (method === 'GET') options.dataType = 'json';
             else { options.data = JSON.stringify(data); options.contentType = 'application/json'; }
             // ApiClient.ajax supplies the authenticated Jellyfin session; getUrl preserves server base paths.
@@ -105,10 +147,20 @@
         function render(config) {
             $('enabled').checked = config.enabled; $('server').checked = config.serverProcessingEnabled === true; $('mode').value = config.defaultMode; $('daytime').value = config.daytimeMode; $('zone').value = config.timeZoneId; $('schedule').checked = config.scheduleEnabled;
             $('windows').replaceChildren(); config.nightWindows.forEach(addWindow); syncWindows();
+            $('dialogue').value = config.dialogueBoostDb == null ? 0 : config.dialogueBoostDb; $('analysis').checked = config.loudnessAnalysisEnabled === true; $('lufs').value = config.analysisTargetLufs == null ? -20 : config.analysisTargetLufs; $('switch').checked = config.switchDuringPlayback === true;
+            $('devices').replaceChildren(); (config.deviceOverrides || []).forEach(addDevice); syncDevices();
             ['balanced', 'night'].forEach(function (key) { profileFields.forEach(function (field) { $(key + '-' + field[0]).value = config[key][field[0]]; }); });
         }
         function read() {
             var config = { enabled: $('enabled').checked, serverProcessingEnabled: $('server').checked, defaultMode: $('mode').value, daytimeMode: $('daytime').value, timeZoneId: $('zone').value.trim(), scheduleEnabled: $('schedule').checked, nightWindows: [] };
+            config.dialogueBoostDb = number('dialogue', 0, 12, 'Dialogue boost'); config.loudnessAnalysisEnabled = $('analysis').checked; config.analysisTargetLufs = number('lufs', -36, -10, 'Measured loudness target'); config.switchDuringPlayback = $('switch').checked; config.deviceOverrides = [];
+            var deviceIds = new Set(); Array.prototype.forEach.call($('devices').children, function (row) {
+                var id = row.querySelector('.vg-device-deviceId').value.trim(), name = row.querySelector('.vg-device-deviceName').value.trim(), raw = row.querySelector('.vg-device-dialogueBoostDb').value, boost = Number(raw);
+                if (!id) throw new Error('Enter a Jellyfin device ID for every override.');
+                if (deviceIds.has(id)) throw new Error('Each device can have only one override.'); deviceIds.add(id);
+                if (raw === '' || !Number.isFinite(boost) || boost < 0 || boost > 12) throw new Error('Device dialogue boost must be between 0 and 12 dB.');
+                config.deviceOverrides.push({ deviceId: id, deviceName: name, enabled: row.querySelector('.vg-device-enabled').checked, mode: row.querySelector('.vg-device-mode').value, dialogueBoostDb: boost });
+            });
             if (!config.timeZoneId) throw new Error('Enter an IANA time zone.');
             Array.prototype.forEach.call($('windows').children, function (row) {
                 var days = Array.prototype.map.call(row.querySelectorAll('.vg-day:checked'), function (input) { return Number(input.value); });
@@ -128,18 +180,41 @@
             catch (response) { message(loaded ? 'Your current values are still shown.' : 'Settings have not loaded.'); error(failure('Could not load settings.', response)); }
             finally { setBusy(false); }
         }
+        function detail(value) { if (value == null) return 'Unavailable'; return typeof value === 'object' ? JSON.stringify(value) : String(value); }
+        async function refreshStatus() {
+            if (statusBusy) return; statusBusy = true; $('refresh').disabled = true; $('status-error').hidden = true;
+            try {
+                var status = await api('GET', null, 'status'), devices = status.devices || []; $('sessions').replaceChildren(); $('known-devices').replaceChildren();
+                if (!devices.length) $('sessions').appendChild(element('p', 'No active playback sessions reported. Start playback, then refresh.'));
+                devices.forEach(function (device) {
+                    var option = element('option'); option.value = device.deviceId || ''; option.label = device.deviceName || device.client || ''; $('known-devices').appendChild(option);
+                    var row = element('article'); row.className = 'vg-session'; row.appendChild(element('h3', device.deviceName || device.deviceId || 'Playback session'));
+                    row.appendChild(element('p', (device.processing ? 'Processing launched' : 'Processing not confirmed') + ' · ' + detail(device.mode)));
+                    row.appendChild(element('p', detail(device.reason)));
+                    row.appendChild(element('p', 'Client: ' + detail(device.client) + ' · Device ID: ' + detail(device.deviceId)));
+                    row.appendChild(element('p', 'Dialogue: ' + detail(device.dialogue) + ' · Analysis: ' + detail(device.analysis)));
+                    $('sessions').appendChild(row);
+                });
+                var analysis = status.analysis || {}; $('analysis-status').textContent = analysis.summary || (typeof status.analysis === 'string' ? status.analysis : 'Loudness analysis: ' + detail(analysis.status || 'No analysis summary available.'));
+                if (analysis.lastError) $('analysis-status').appendChild(element('span', ' Last analysis error: ' + analysis.lastError));
+                $('freshness').textContent = 'Updated ' + (status.serverTimeUtc ? new Date(status.serverTimeUtc).toLocaleString() : new Date().toLocaleString());
+            } catch (response) { $('status-error').textContent = failure('Could not refresh playback status.', response); $('status-error').hidden = false; }
+            finally { statusBusy = false; $('refresh').disabled = false; }
+        }
         $('form').addEventListener('input', markDirty); $('form').addEventListener('change', markDirty);
         $('add').addEventListener('click', function () { var row = addWindow({ days: [0, 1, 2, 3, 4, 5, 6], start: '22:00', end: '07:00' }); markDirty(); row.querySelector('input').focus(); });
         $('reload').addEventListener('click', load);
+        $('refresh').addEventListener('click', refreshStatus);
+        $('add-device').addEventListener('click', function () { var row = addDevice({ deviceId: '', deviceName: '', enabled: true, mode: 'Auto', dialogueBoostDb: Number($('dialogue').value) || 0 }); markDirty(); row.querySelector('input').focus(); });
         $('form').addEventListener('submit', async function (event) {
             event.preventDefault(); if (busy || !loaded) return; error('');
             var config; try { config = read(); } catch (problem) { error(problem.message); return; }
             setBusy(true); message('Saving settings…');
-            try { await api('POST', config); dirty = false; $('dirty').hidden = true; message('Settings saved. Start new playback to use the selected server audio mode.'); }
+            try { await api('POST', config); dirty = false; $('dirty').hidden = true; message(config.switchDuringPlayback ? 'Settings saved. Check playback status for automatic switching; start new playback if your client cannot restart.' : 'Settings saved. Start new playback to use the selected server audio mode.'); }
             catch (response) { message('Changes have not been saved. Your entries are still here.'); error(failure('Could not save settings.', response)); }
             finally { setBusy(false); }
         });
-        page.addEventListener('viewshow', function () { if (!loaded) load(); });
+        page.addEventListener('viewshow', function () { if (!loaded) { load(); refreshStatus(); } });
         window.addEventListener('beforeunload', function (event) { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
     })();
     </script>

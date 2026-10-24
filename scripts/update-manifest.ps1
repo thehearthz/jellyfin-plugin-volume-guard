@@ -1,5 +1,5 @@
 param(
-    [string]$Version = '0.2.0.0',
+    [string]$Version = '0.3.0.0',
     [string]$Repository = 'thehearthz/jellyfin-plugin-volume-guard'
 )
 $ErrorActionPreference = 'Stop'
@@ -13,13 +13,13 @@ $previous = if (Test-Path -LiteralPath $manifestPath) { @(Get-Content -LiteralPa
 $entry = [ordered]@{
     guid = 'c49aef32-6c2e-462c-a5ee-40e18c8d28af'
     name = 'Volume Guard'
-    overview = 'Server audio leveling, peak limiting and automatic night profiles'
-    description = 'Experimental server audio processing for Jellyfin 12.2 and standard clients such as Moonfin. Enable server processing in the plugin settings; audio is converted while video can be copied where compatible. Includes a manual switch, Balanced/Night modes and weekly schedules. Changes apply to new playback. No companion app is required for the server route; Direct Play outside playback negotiation bypasses processing. Physical client and Live TV validation remains necessary.'
+    overview = 'Server leveling, dialogue boost, measured loudness and night profiles'
+    description = 'Experimental audio processing for Jellyfin 12.2 and standard Moonfin. Includes leveling, peak limiting, dialogue emphasis, per-device modes, cached local-library loudness analysis and administrator playback status. Optional active switching requests a brief playback reconnect; Live TV returns to the live edge. No companion app required. Enable server processing in plugin settings. Physical client and Live TV validation remains necessary.'
     owner = $Repository.Split('/')[0]
     category = 'General'
     versions = @([ordered]@{
         version = $Version
-        changelog = 'Adds opt-in server audio processing for standard Moonfin: requests audio conversion at playback negotiation, applies leveling and peak limiting in FFmpeg, and keeps video copying available where compatible. Manual on/off, Balanced/Night/Auto and weekly schedules are in Jellyfin plugin settings. Restart playback after changes. No companion app or Moonfin preview-screen/player button is required. Validate on a real server and Chromecast before relying on it.'
+        changelog = 'Adds dialogue emphasis, whole-track local movie/episode loudness analysis with persistent cache, per-device mode/boost overrides, confirmed encoder status, and opt-in switching during playback via a brief reconnect. Movies resume at the reported position; Live TV returns to the live edge. Run Volume Guard loudness analysis in Scheduled Tasks after enabling analysis. New features default off/inherit. Automated checks pass; actual Chromecast/server/Live TV playback remains unverified.'
         targetAbi = '12.2.0.0'
         sourceUrl = "https://github.com/$Repository/releases/download/v$Version/volume-guard-server-$Version.zip"
         checksum = (Get-FileHash -LiteralPath $archive -Algorithm MD5).Hash.ToLowerInvariant()

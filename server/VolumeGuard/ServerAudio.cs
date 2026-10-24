@@ -50,4 +50,16 @@ public static class ServerAudio
         if (!output.Success) throw new InvalidOperationException("FFmpeg output argument was not found.");
         return arguments.Insert(output.Index, "-af \"" + filter + "\" ");
     }
+
+    public static string PrependFilter(string arguments, string filter)
+    {
+        var matches = AudioFilter.Matches(arguments);
+        if (matches.Count > 1) throw new InvalidOperationException("Multiple audio filter options are not supported.");
+        if (matches.Count == 0) return AppendFilter(arguments, filter);
+        var value = matches[0].Groups["value"];
+        var old = value.Value;
+        var quote = old[0] is '"' or '\'' ? old[0] : '"';
+        var body = old[0] is '"' or '\'' ? old[1..^1] : old;
+        return arguments[..value.Index] + quote + filter + "," + body + quote + arguments[(value.Index + value.Length)..];
+    }
 }

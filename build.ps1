@@ -1,4 +1,4 @@
-param([switch]$ServerOnly, [switch]$LegacyCompanion, [switch]$SkipTests, [string]$Version = '0.2.0.0')
+param([switch]$ServerOnly, [switch]$LegacyCompanion, [switch]$SkipTests, [string]$Version = '0.3.0.0')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw 'Version must have four numeric parts.' }
 Set-Location $PSScriptRoot
@@ -13,12 +13,19 @@ if ($LASTEXITCODE -ne 0) { throw 'Server build failed.' }
 if (!$SkipTests) {
     & $dotnetCommand build server/VolumeGuard.Tests/VolumeGuard.Tests.csproj -c Release -p:NuGetAudit=false
     if ($LASTEXITCODE -ne 0) { throw 'Server test build failed.' }
-    & $dotnetCommand server/VolumeGuard.Tests/bin/Release/net10.0/VolumeGuard.Tests.dll
+    if ($env:VOLUMEGUARD_FFMPEG) { & $dotnetCommand server/VolumeGuard.Tests/bin/Release/net10.0/VolumeGuard.Tests.dll $env:VOLUMEGUARD_FFMPEG }
+    else { & $dotnetCommand server/VolumeGuard.Tests/bin/Release/net10.0/VolumeGuard.Tests.dll }
     if ($LASTEXITCODE -ne 0) { throw 'Server tests failed.' }
     & $dotnetCommand build server/VolumeGuard.HttpTests/VolumeGuard.HttpTests.csproj -c Release -p:NuGetAudit=false
     if ($LASTEXITCODE -ne 0) { throw 'HTTP test build failed.' }
     & $dotnetCommand server/VolumeGuard.HttpTests/bin/Release/net10.0/VolumeGuard.HttpTests.dll
     if ($LASTEXITCODE -ne 0) { throw 'HTTP tests failed.' }
+    foreach ($suite in @('Switching', 'Analysis')) {
+        & $dotnetCommand build "server/VolumeGuard.${suite}Tests/VolumeGuard.${suite}Tests.csproj" -c Release -p:NuGetAudit=false
+        if ($LASTEXITCODE -ne 0) { throw "$suite test build failed." }
+        & $dotnetCommand "server/VolumeGuard.${suite}Tests/bin/Release/net10.0/VolumeGuard.${suite}Tests.dll"
+        if ($LASTEXITCODE -ne 0) { throw "$suite tests failed." }
+    }
 }
 $plugin = Join-Path $PSScriptRoot 'server/VolumeGuard/bin/Release/net10.0/Jellyfin.Plugin.VolumeGuard.dll'
 Copy-Item -LiteralPath $plugin -Destination $output -Force
@@ -44,7 +51,9 @@ if ($LegacyCompanion -and !$ServerOnly) {
     finally { Pop-Location }
 }
 
-$hashes = Get-ChildItem -LiteralPath $output -File | Where-Object Extension -In '.zip', '.dll', '.apk' | ForEach-Object {
+$releaseFiles = @('Jellyfin.Plugin.VolumeGuard.dll', "volume-guard-server-$Version.zip", "volume-guard-source-$Version.zip")
+if ($LegacyCompanion -and !$ServerOnly) { $releaseFiles += 'volume-guard-tv-0.1.0-debug.apk' }
+$hashes = Get-ChildItem -LiteralPath $output -File | Where-Object Name -In $releaseFiles | ForEach-Object {
     $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     "$hash  $($_.Name)"
 }

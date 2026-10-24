@@ -19,6 +19,18 @@ public static class Policy
     public static void Validate(Configuration? config)
     {
         if (config is null) throw new ArgumentException("Configuration is required.");
+        Range(config.DialogueBoostDb, 0, 12, "dialogueBoostDb");
+        Range(config.AnalysisTargetLufs, -36, -10, "analysisTargetLufs");
+        if (config.DeviceOverrides is null || config.DeviceOverrides.Length > 64) throw new ArgumentException("deviceOverrides must contain at most 64 devices.");
+        var deviceIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var device in config.DeviceOverrides)
+        {
+            if (device is null || string.IsNullOrWhiteSpace(device.DeviceId) || device.DeviceId.Length > 256 || device.DeviceId != device.DeviceId.Trim() || !deviceIds.Add(device.DeviceId))
+                throw new ArgumentException("Each device override needs a unique, nonempty deviceId of at most 256 characters without outer spaces.");
+            if (device.DeviceName is null || device.DeviceName.Length > 128) throw new ArgumentException("deviceName must be at most 128 characters.");
+            if (device.Mode is not ("Off" or "Balanced" or "Night" or "Auto")) throw new ArgumentException("Device mode must be Off, Balanced, Night or Auto.");
+            Range(device.DialogueBoostDb, 0, 12, "device.dialogueBoostDb");
+        }
         if (config.DefaultMode is not ("Off" or "Balanced" or "Night" or "Auto")) throw new ArgumentException("defaultMode must be Off, Balanced, Night or Auto.");
         if (config.DaytimeMode is not ("Off" or "Balanced" or "Night")) throw new ArgumentException("daytimeMode must be Off, Balanced or Night.");
         if (string.IsNullOrWhiteSpace(config.TimeZoneId) || config.TimeZoneId.Length > 128) throw new ArgumentException("timeZoneId is required (maximum 128 characters).");

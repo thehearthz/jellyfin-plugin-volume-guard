@@ -18,6 +18,8 @@ public sealed class ServiceRegistrator : IPluginServiceRegistrator
 {
     public void RegisterServices(IServiceCollection services, IServerApplicationHost applicationHost)
     {
+        services.AddSingleton<AnalysisService>();
+        services.AddHostedService<PlaybackSwitchingService>();
         DecorateTranscodeManager(services);
         services.Configure<MvcOptions>(options => options.Filters.Add<VolumeGuardPlaybackFilter>());
     }
@@ -37,7 +39,8 @@ public sealed class ServiceRegistrator : IPluginServiceRegistrator
             descriptor.ImplementationInstance is null));
         services.AddSingleton<ITranscodeManager>(provider => new VolumeGuardTranscodeManager(
             provider.GetRequiredService<OriginalTranscodeManager>().Value,
-            provider.GetRequiredService<ILogger<VolumeGuardTranscodeManager>>()));
+            provider.GetRequiredService<ILogger<VolumeGuardTranscodeManager>>(),
+            provider.GetService<AnalysisService>()));
     }
 
     private sealed class OriginalTranscodeManager(ITranscodeManager value, bool owns) : IDisposable
@@ -55,7 +58,7 @@ public sealed class VolumeGuardPlaybackFilter : IAsyncActionFilter
             || action.ControllerName != "MediaInfo"
             || action.ActionName is not ("GetPostedPlaybackInfo" or "OpenLiveStream")
             || context.HttpContext.User.Identity?.IsAuthenticated != true
-            || !ProcessingActive())
+            || !ProcessingActive(context.HttpContext.User.FindFirst("Jellyfin-DeviceId")?.Value))
         {
             await next().ConfigureAwait(false);
             return;
@@ -64,7 +67,14 @@ public sealed class VolumeGuardPlaybackFilter : IAsyncActionFilter
         // arguments, preserving codec/video choices and all authorization/user policy checks.
         context.ActionArguments["enableDirectPlay"] = (bool?)false;
         context.ActionArguments["enableDirectStream"] = (bool?)false;
-        if (action.ActionName == "GetPostedPlaybackInfo") context.ActionArguments["allowAudioStreamCopy"] = (bool?)false;
+        if (action.ActionName == "GetPostedPlaybackInfo")
+        {
+            context.ActionArguments["allowAudioStreamCopy"] = (bool?)false;
+            // Moonfin's Live TV direct-play preference otherwise explicitly disables
+            // encoding. Opting into server DSP requires requesting conversion; Jellyfin
+            // still enforces the user's audio/video transcoding permissions.
+            context.ActionArguments["enableTranscoding"] = (bool?)true;
+        }
         var executed = await next().ConfigureAwait(false);
         if (executed.Result is not ObjectResult result || result.StatusCode is >= 400) return;
         if (result.Value is PlaybackInfoResponse playback)
@@ -96,11 +106,11 @@ public sealed class VolumeGuardPlaybackFilter : IAsyncActionFilter
         Detail = "Enable audio transcoding for this user and client, or turn off Volume Guard server processing."
     }) { StatusCode = 409 };
 
-    public static bool ProcessingActive()
+    public static bool ProcessingActive(string? deviceId = null)
     {
         lock (Plugin.ConfigurationLock)
         {
-            try { return ServerAudio.Filter(Plugin.Instance.Configuration, DateTimeOffset.UtcNow) is not null; }
+            try { return ServerAudio.Filter(PlaybackSettings.Resolve(deviceId), DateTimeOffset.UtcNow) is not null; }
             catch (ArgumentException) { return false; }
         }
     }
@@ -133,26 +143,63 @@ public sealed class VolumeGuardPlaybackFilter : IAsyncActionFilter
     }
 }
 
-public sealed class VolumeGuardTranscodeManager(ITranscodeManager inner, ILogger<VolumeGuardTranscodeManager> logger) : ITranscodeManager
+public sealed class VolumeGuardTranscodeManager(ITranscodeManager inner, ILogger<VolumeGuardTranscodeManager> logger, AnalysisService? analysis = null) : ITranscodeManager
 {
-    public Task<TranscodingJob> StartFfMpeg(StreamState state, string outputPath, string commandLineArguments,
+    public async Task<TranscodingJob> StartFfMpeg(StreamState state, string outputPath, string commandLineArguments,
         Guid userId, TranscodingJobType transcodingJobType, CancellationTokenSource cancellationTokenSource, string? workingDirectory = null)
     {
         string? filter;
+        Configuration? config = null;
+        var now = DateTimeOffset.UtcNow;
         lock (Plugin.ConfigurationLock)
         {
-            try { filter = ServerAudio.Filter(Plugin.Instance.Configuration, DateTimeOffset.UtcNow); }
+            try { config = PlaybackSettings.Resolve(state.Request.DeviceId); filter = ServerAudio.Filter(config, now); }
             catch (ArgumentException) { filter = null; logger.LogWarning("Volume Guard configuration is invalid; server audio processing is disabled."); }
         }
         if (filter is not null && state.AudioStream is not null)
         {
+            ProcessingRegistry.Record(new(state.Request.DeviceId, state.Request.PlaySessionId ?? "", PlaybackSettings.Mode(config!, now),
+                "Not confirmed", "Not confirmed", "", now, "starting", "Audio encoding has not been confirmed yet.", state.Request.Id));
             // Never silently advertise processing while passing copied audio through.
             if (string.Equals(state.OutputAudioCodec, "copy", StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Volume Guard cannot process copied audio. Start playback again with audio transcoding enabled.");
+            var dialogue = DialogueAudio.Filter(config!.DialogueBoostDb, state.AudioStream.ChannelLayout);
+            // Center-channel emphasis must run before Jellyfin's existing downmix graph.
+            if (dialogue is not null) commandLineArguments = ServerAudio.PrependFilter(commandLineArguments, dialogue);
+            var mode = PlaybackSettings.Mode(config, now);
+            var profile = mode == "Night" ? config.Night : config.Balanced;
+            var fingerprint = PlaybackSettings.Fingerprint(config, now);
+            var gain = config.LoudnessAnalysisEnabled ? analysis?.TryGetGain(state.MediaSource?.Path ?? state.MediaPath,
+                state.AudioStream.Index, config.AnalysisTargetLufs, profile.MaxGainDb, profile.LimiterCeilingDb) : null;
+            if (gain.HasValue)
+            {
+                // Measured gain and adaptive gain share the profile's boost allowance.
+                profile.MaxGainDb = Math.Max(0, profile.MaxGainDb - Math.Max(0, gain.Value));
+                filter = "volume=" + gain.Value.ToString("0.########", System.Globalization.CultureInfo.InvariantCulture) + "dB," + ServerAudio.Filter(config, now);
+            }
             commandLineArguments = ServerAudio.AppendFilter(commandLineArguments, filter);
-            logger.LogInformation("Volume Guard is processing encoded audio for playback session {PlaySessionId}.", state.Request.PlaySessionId);
+            try
+            {
+                var job = await inner.StartFfMpeg(state, outputPath, commandLineArguments, userId, transcodingJobType, cancellationTokenSource, workingDirectory).ConfigureAwait(false);
+                ProcessingRegistry.Record(new(state.Request.DeviceId, state.Request.PlaySessionId ?? "", mode,
+                    dialogue is null ? "Off" : dialogue.StartsWith("pan=", StringComparison.Ordinal) ? "Center channel emphasis" : "Speech EQ",
+                    !config.LoudnessAnalysisEnabled ? "Disabled" : gain.HasValue ? $"Measured title gain {gain.Value:+0.0;-0.0;0.0} dB" : "No fresh track measurement; real-time leveling",
+                    fingerprint, now, "launched", "Audio encoding launched with Volume Guard filters.", state.Request.Id));
+                ProcessingRegistry.SetSwitch(state.Request.DeviceId, "New audio encoding process launched with the current settings.");
+                logger.LogInformation("Volume Guard is processing encoded audio for playback session {PlaySessionId}.", state.Request.PlaySessionId);
+                return job;
+            }
+            catch
+            {
+                ProcessingRegistry.Record(new(state.Request.DeviceId, state.Request.PlaySessionId ?? "", mode, "Not launched", "Not launched", "", now,
+                    "failed", "Audio encoding could not start. Check the Jellyfin transcoding log.", state.Request.Id));
+                throw;
+            }
         }
-        return inner.StartFfMpeg(state, outputPath, commandLineArguments, userId, transcodingJobType, cancellationTokenSource, workingDirectory);
+        var bypassed = await inner.StartFfMpeg(state, outputPath, commandLineArguments, userId, transcodingJobType, cancellationTokenSource, workingDirectory).ConfigureAwait(false);
+        ProcessingRegistry.Record(new(state.Request.DeviceId, state.Request.PlaySessionId ?? "", "Off", "Off", "Off", "off", now,
+            "bypassed", "This conversion did not use Volume Guard audio filters.", state.Request.Id));
+        return bypassed;
     }
 
     public TranscodingJob? GetTranscodingJob(string playSessionId) => inner.GetTranscodingJob(playSessionId);

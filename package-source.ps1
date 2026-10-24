@@ -1,4 +1,4 @@
-param([string]$Version = '0.2.0.0')
+param([string]$Version = '0.3.0.0')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw 'Version must have four numeric parts.' }
 Add-Type -AssemblyName System.IO.Compression
@@ -7,7 +7,7 @@ $archivePath = Join-Path $root "artifacts/volume-guard-source-$Version.zip"
 New-Item -ItemType Directory -Force -Path (Join-Path $root 'artifacts') | Out-Null
 $stream = [IO.File]::Open($archivePath, [IO.FileMode]::Create)
 $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Create)
-$excluded = @('.git', '.build-tools', 'moonfin-source', 'artifacts', 'bin', 'obj', 'build', '.gradle', '.kotlin', 'classes', 'node_modules')
+$excluded = @('.git', '.build-tools', 'moonfin-source', 'artifacts', 'bin', 'obj', 'build', '.gradle', '.kotlin', 'classes', 'node_modules', 'inspection-v3', 'taste-v3')
 function Add-SourceFolder([string]$folder) {
     foreach ($item in Get-ChildItem -LiteralPath $folder -Force) {
         if ($item.Name -in $excluded) { continue }
@@ -23,7 +23,8 @@ function Add-SourceFolder([string]$folder) {
 }
 try { Add-SourceFolder $root }
 finally { $archive.Dispose(); $stream.Dispose() }
-Get-ChildItem -LiteralPath (Join-Path $root 'artifacts') -File | Where-Object Extension -In '.zip', '.dll', '.apk' | ForEach-Object {
+$releaseFiles = @('Jellyfin.Plugin.VolumeGuard.dll', "volume-guard-server-$Version.zip", "volume-guard-source-$Version.zip")
+Get-ChildItem -LiteralPath (Join-Path $root 'artifacts') -File | Where-Object Name -In $releaseFiles | ForEach-Object {
     "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
 } | Set-Content -LiteralPath (Join-Path $root 'artifacts/SHA256SUMS') -Encoding utf8NoBOM
 Write-Output "Source archive: $archivePath"
