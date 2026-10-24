@@ -1,0 +1,11 @@
+.build-tools/
+artifacts/
+**/bin/
+**/obj/
+**/build/
+**/.gradle/
+**/.kotlin/
+**/local.properties
+**/node_modules/
+ui-tests/screenshots/
+androidtv-source/.git

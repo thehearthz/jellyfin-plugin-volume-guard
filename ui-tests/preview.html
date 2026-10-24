@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Volume Guard</title><style>body{margin:0;background:#101010;color:#eee;font:16px Arial,sans-serif}input,select{background:#252525;color:inherit;border:1px solid #777;padding:.5em}button{background:#333;border:0;color:inherit;padding:.7em 1em;cursor:pointer}button[type=submit]{background:#00a4dc;color:#fff}button:disabled{opacity:.5}#vg-error{color:#ffafaf}summary{font-weight:600}fieldset{color:inherit}h1,h2{font-weight:600}</style><script>window.requests=[];window.failGet=0;window.failPost=0;window.saved=null;window.ApiClient={getUrl:function(path){return '/jellyfin/'+path},ajax:async function(options){requests.push(options);if(options.url!=='/jellyfin/VolumeGuard/configuration')throw new Error('Base path lost');if(options.type==='GET'){if(failGet)throw{status:failGet};return {"enabled":true,"defaultMode":"Auto","daytimeMode":"Balanced","timeZoneId":"America/New_York","scheduleEnabled":true,"nightWindows":[{"days":[0,1,2,3,4,5,6],"start":"22:00","end":"07:00"}],"balanced":{"targetRmsDb":-20,"maxGainDb":6,"limiterCeilingDb":-1,"attackMs":10,"releaseMs":500},"night":{"targetRmsDb":-26,"maxGainDb":9,"limiterCeilingDb":-4,"attackMs":5,"releaseMs":800}}}if(failPost)throw{status:failPost};saved=JSON.parse(options.data);}};</script></head><body>
+<div id="volumeGuardPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox,emby-select">
+    <style>
+        #volumeGuardPage .vg-content { max-width: 68em; margin: 0 auto; padding: 1.5em; }
+        #volumeGuardPage h1 { font-size: 1.5em; }
+        #volumeGuardPage h2 { font-size: 1.15em; margin-top: 0; }
+        #volumeGuardPage p { line-height: 1.5; }
+        #volumeGuardPage .vg-section { margin-block: 2em; }
+        /* Two equal tracks and one gutter occupy the full section width. Host supplies colours and fonts. */
+        #volumeGuardPage .vg-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25em; }
+        #volumeGuardPage .vg-field { min-width: 0; }
+        #volumeGuardPage .vg-field label { display: block; margin-bottom: .5em; }
+        #volumeGuardPage input:not([type=checkbox]), #volumeGuardPage select { box-sizing: border-box; width: 100%; min-height: 2.75em; font: inherit; }
+        #volumeGuardPage .vg-check { display: inline-flex; align-items: center; gap: .6em; min-height: 2.75em; }
+        #volumeGuardPage input[type=checkbox] { width: 1.25em; height: 1.25em; }
+        #volumeGuardPage .vg-help { font-size: .9em; margin-block: .5em 1em; }
+        #volumeGuardPage fieldset { min-width: 0; border: 1px solid currentColor; border-radius: .2em; padding: 1em; margin: 1em 0; }
+        #volumeGuardPage .vg-days { display: flex; flex-wrap: wrap; gap: .25em 1em; }
+        #volumeGuardPage .vg-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .75em; margin-block: 1em; }
+        #volumeGuardPage button { min-height: 2.75em; }
+        #volumeGuardPage .vg-notice { padding: 1em; background: rgba(128,128,128,.12); }
+        #volumeGuardPage details summary { cursor: pointer; padding-block: .75em; }
+        #volumeGuardPage :focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+        #volumeGuardPage [hidden] { display: none !important; }
+        @media (max-width: 620px) { #volumeGuardPage .vg-fields { grid-template-columns: 1fr; } #volumeGuardPage .vg-content { padding: 1em; } }
+    </style>
+    <div class="content-primary vg-content">
+        <h1>Volume Guard</h1>
+        <p>Set shared listening profiles and a weekly night schedule for your companion TV player.</p>
+        <p class="vg-notice">Requires the Volume Guard Android TV companion. This plugin cannot add controls to the stock Jellyfin TV app. Audio processing runs in the companion player, where audio passthrough is disabled so audio can be processed. These settings do not indicate that processing is active.</p>
+        <form id="vg-form">
+            <fieldset id="vg-settings" disabled style="border:0;padding:0;margin:0">
+                <section class="vg-section" aria-labelledby="vg-playback-heading">
+                    <h2 id="vg-playback-heading">Playback defaults</h2>
+                    <label class="vg-check"><input id="vg-enabled" type="checkbox"><span>Enable Volume Guard</span></label>
+                    <p class="vg-help">Turning this off makes the companion use unprocessed audio, including during scheduled hours.</p>
+                    <div class="vg-fields">
+                        <div class="vg-field"><label for="vg-mode">Default player mode</label><select id="vg-mode" is="emby-select"><option>Off</option><option>Balanced</option><option>Night</option><option>Auto</option></select><p class="vg-help">Auto uses Night during scheduled hours and your daytime mode at other times. A player override takes precedence.</p></div>
+                        <div class="vg-field"><label for="vg-daytime">Daytime mode</label><select id="vg-daytime" is="emby-select"><option>Off</option><option>Balanced</option><option>Night</option></select><p class="vg-help">Balanced levels quieter passages gently. Night uses a quieter target and a lower peak ceiling.</p></div>
+                    </div>
+                </section>
+                <section class="vg-section" aria-labelledby="vg-schedule-heading">
+                    <h2 id="vg-schedule-heading">Night schedule</h2>
+                    <label class="vg-check"><input id="vg-schedule" type="checkbox"><span>Use scheduled night hours in Auto mode</span></label>
+                    <div class="vg-field"><label for="vg-zone">Time zone (IANA name)</label><input id="vg-zone" is="emby-input" required autocomplete="off" placeholder="America/New_York" aria-describedby="vg-zone-help"><p id="vg-zone-help" class="vg-help">For example, America/New_York, Europe/London, or UTC. Daylight saving follows this time zone.</p></div>
+                    <p id="vg-window-help" class="vg-help">Days are the days each window starts. Friday 22:00 to 07:00 ends Saturday morning. End times are exclusive; equal start and end times are not allowed.</p>
+                    <div id="vg-windows" aria-describedby="vg-window-help"></div>
+                    <p id="vg-empty" hidden>No night windows. Auto will use the daytime mode.</p>
+                    <button id="vg-add" type="button" is="emby-button" class="raised">Add night window</button>
+                </section>
+                <details class="vg-section"><summary>Advanced audio profiles</summary>
+                    <p class="vg-help">These are signal levels, not a room volume limit or measured LUFS loudness. Higher maximum gain can raise background noise. Keep the target at or below the peak ceiling.</p>
+                    <div id="vg-profiles"></div>
+                </details>
+            </fieldset>
+            <div class="vg-actions"><button id="vg-save" type="submit" is="emby-button" class="raised button-submit block" disabled>Save settings</button><button id="vg-reload" type="button" is="emby-button" class="raised">Reload settings</button><span id="vg-dirty" hidden>Unsaved changes</span></div>
+            <p id="vg-status" role="status" aria-live="polite">Loading settings…</p>
+            <p id="vg-error" role="alert" hidden></p>
+        </form>
+    </div>
+    <script>
+    (function () {
+        'use strict';
+        var page = document.getElementById('volumeGuardPage');
+        var $ = function (id) { return page.querySelector('#vg-' + id); };
+        var loaded = false, dirty = false, busy = false, windowId = 0;
+        var dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+        var profileFields = [
+            ['targetRmsDb', 'Target RMS (dBFS)', -40, -6], ['maxGainDb', 'Maximum gain (dB)', 0, 24],
+            ['limiterCeilingDb', 'Peak ceiling (dBFS)', -20, 0], ['attackMs', 'Attack (ms)', 1, 200], ['releaseMs', 'Release (ms)', 20, 5000]
+        ];
+        function element(tag, text) { var node = document.createElement(tag); if (text) node.textContent = text; return node; }
+        function message(text) { $('status').textContent = text; }
+        function error(text) { $('error').hidden = !text; $('error').textContent = text || ''; }
+        function markDirty() { if (!loaded || busy) return; dirty = true; $('dirty').hidden = false; message('Changes have not been saved.'); error(''); }
+        function setBusy(value) { busy = value; $('settings').disabled = value || !loaded; $('save').disabled = value || !loaded; $('reload').disabled = value; }
+        function syncWindows() { $('empty').hidden = $('windows').children.length !== 0; $('add').disabled = $('windows').children.length >= 32; }
+        function addWindow(value) {
+            var id = ++windowId, row = element('fieldset'), legend = element('legend', 'Night window'); row.className = 'vg-window'; row.appendChild(legend);
+            var days = element('div'); days.className = 'vg-days';
+            dayNames.forEach(function (name, index) { var label = element('label'), input = element('input'); label.className = 'vg-check'; input.type = 'checkbox'; input.value = index; input.className = 'vg-day'; input.checked = value.days.indexOf(index) !== -1; label.appendChild(input); label.appendChild(element('span', name)); days.appendChild(label); });
+            row.appendChild(days);
+            var times = element('div'); times.className = 'vg-fields';
+            ['start', 'end'].forEach(function (key) { var field = element('div'), label = element('label', key === 'start' ? 'Start time' : 'End time'), input = element('input'); field.className = 'vg-field'; input.type = 'time'; input.required = true; input.id = 'vg-window-' + id + '-' + key; input.className = 'vg-' + key; input.value = value[key]; label.htmlFor = input.id; field.appendChild(label); field.appendChild(input); times.appendChild(field); });
+            row.appendChild(times); var remove = element('button', 'Remove window'); remove.type = 'button'; remove.className = 'raised'; remove.setAttribute('is', 'emby-button'); remove.addEventListener('click', function () { row.remove(); syncWindows(); markDirty(); }); row.appendChild(remove); $('windows').appendChild(row); syncWindows(); return row;
+        }
+        ['balanced', 'night'].forEach(function (profile) {
+            var group = element('fieldset'), legend = element('legend', profile === 'balanced' ? 'Balanced profile' : 'Night profile'), grid = element('div'); grid.className = 'vg-fields'; group.appendChild(legend);
+            profileFields.forEach(function (entry) { var field = element('div'), label = element('label', entry[1]), input = element('input'); field.className = 'vg-field'; input.id = 'vg-' + profile + '-' + entry[0]; input.type = 'number'; input.min = entry[2]; input.max = entry[3]; input.step = 'any'; input.required = true; input.setAttribute('is', 'emby-input'); label.htmlFor = input.id; field.appendChild(label); field.appendChild(input); grid.appendChild(field); }); group.appendChild(grid); $('profiles').appendChild(group);
+        });
+        function api(method, data) {
+            var options = { type: method, url: ApiClient.getUrl('VolumeGuard/configuration') };
+            if (method === 'GET') options.dataType = 'json';
+            else { options.data = JSON.stringify(data); options.contentType = 'application/json'; }
+            // ApiClient.ajax supplies the authenticated Jellyfin session; getUrl preserves server base paths.
+            return ApiClient.ajax(options);
+        }
+        function failure(prefix, response) {
+            var status = response && response.status;
+            return prefix + (status === 401 || status === 403 ? ' Sign in as a Jellyfin administrator.' : status === 400 ? ' The server rejected these values. Check the time zone, windows, and profile ranges.' : ' Check the server connection and try again.');
+        }
+        function render(config) {
+            $('enabled').checked = config.enabled; $('mode').value = config.defaultMode; $('daytime').value = config.daytimeMode; $('zone').value = config.timeZoneId; $('schedule').checked = config.scheduleEnabled;
+            $('windows').replaceChildren(); config.nightWindows.forEach(addWindow); syncWindows();
+            ['balanced', 'night'].forEach(function (key) { profileFields.forEach(function (field) { $(key + '-' + field[0]).value = config[key][field[0]]; }); });
+        }
+        function read() {
+            var config = { enabled: $('enabled').checked, defaultMode: $('mode').value, daytimeMode: $('daytime').value, timeZoneId: $('zone').value.trim(), scheduleEnabled: $('schedule').checked, nightWindows: [] };
+            if (!config.timeZoneId) throw new Error('Enter an IANA time zone.');
+            Array.prototype.forEach.call($('windows').children, function (row) {
+                var days = Array.prototype.map.call(row.querySelectorAll('.vg-day:checked'), function (input) { return Number(input.value); });
+                var start = row.querySelector('.vg-start').value, end = row.querySelector('.vg-end').value;
+                if (!days.length) throw new Error('Choose at least one start day for each night window.');
+                if (!/^\d{2}:\d{2}$/.test(start) || !/^\d{2}:\d{2}$/.test(end) || start === end) throw new Error('Each night window needs different start and end times.');
+                config.nightWindows.push({ days: days, start: start, end: end });
+            });
+            ['balanced', 'night'].forEach(function (key) { config[key] = {}; profileFields.forEach(function (field) { var value = Number($(key + '-' + field[0]).value); if (!Number.isFinite(value) || value < field[2] || value > field[3]) throw new Error('Check the ' + key + ' profile: ' + field[1] + ' must be between ' + field[2] + ' and ' + field[3] + '.'); config[key][field[0]] = value; }); if (config[key].targetRmsDb > config[key].limiterCeilingDb) throw new Error('The ' + key + ' target must be at or below its peak ceiling.'); });
+            return config;
+        }
+        async function load() {
+            if (busy) return;
+            if (dirty && !window.confirm('Discard unsaved Volume Guard changes and reload?')) return;
+            setBusy(true); error(''); message('Loading settings…');
+            try { var config = await api('GET'); render(config); loaded = true; dirty = false; $('dirty').hidden = true; message('Settings loaded.'); }
+            catch (response) { message(loaded ? 'Your current values are still shown.' : 'Settings have not loaded.'); error(failure('Could not load settings.', response)); }
+            finally { setBusy(false); }
+        }
+        $('form').addEventListener('input', markDirty); $('form').addEventListener('change', markDirty);
+        $('add').addEventListener('click', function () { var row = addWindow({ days: [0, 1, 2, 3, 4, 5, 6], start: '22:00', end: '07:00' }); markDirty(); row.querySelector('input').focus(); });
+        $('reload').addEventListener('click', load);
+        $('form').addEventListener('submit', async function (event) {
+            event.preventDefault(); if (busy || !loaded) return; error('');
+            var config; try { config = read(); } catch (problem) { error(problem.message); return; }
+            setBusy(true); message('Saving settings…');
+            try { await api('POST', config); dirty = false; $('dirty').hidden = true; message('Settings saved. The companion uses them when it next refreshes its policy.'); }
+            catch (response) { message('Changes have not been saved. Your entries are still here.'); error(failure('Could not save settings.', response)); }
+            finally { setBusy(false); }
+        });
+        page.addEventListener('viewshow', function () { if (!loaded) load(); });
+        window.addEventListener('beforeunload', function (event) { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
+    })();
+    </script>
+</div><script>document.getElementById('volumeGuardPage').dispatchEvent(new Event('viewshow'));</script></body></html>
