@@ -30,7 +30,9 @@ jobs:
           echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/flutter/bin/flutter" --version
       - name: Install Android native build components
-        run: sdkmanager 'ndk;28.2.13676358' 'cmake;3.22.1' 'platforms;android-36'
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;35.0.0 ndk;28.2.13676358 cmake;3.22.1'
       - name: Resolve pinned dependencies
         working-directory: moonfin
         run: flutter pub get
